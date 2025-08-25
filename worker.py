@@ -1,307 +1,327 @@
-# worker.py
-# Bộ khung mới, ổn định cho việc chạy auto với Minicap. (Phiên bản hoàn thiện)
-
 import threading
+import queue
 import time
-from queue import Queue, Empty
-from datetime import datetime, timedelta
+import logging
+import cv2
 import numpy as np
+import subprocess
 
-# Import các thành phần cần thiết từ dự án của bạn
-from minicap_manager import MinicapManager
-from module import log_wk
-from flows_logout import logout_once
-from flows_login import login_once
-from flows_lien_minh import join_guild_once, ensure_guild_inside
-from flows_thoat_lien_minh import run_guild_leave_flow
-from flows_xay_dung_lien_minh import run_guild_build_flow
-from flows_vien_chinh import run_guild_expedition_flow
-from flows_chuc_phuc import run_bless_flow
-from utils_crypto import decrypt
+# Import các utilities (đã được cập nhật để dùng config.py)
+import adb_utils
+import image_utils
 
+try:
+    import config  # Import cấu hình để sử dụng SCREEN_W/H
+except ImportError:
+    logging.error("Không tìm thấy config.py trong worker.py. Sử dụng giá trị mặc định.")
+    config = type('Config', (object,), {'SCREEN_W': 900, 'SCREEN_H': 1600})
 
-# <<< BỔ SUNG: Lớp SimpleNoxWorker để tương thích với các file flows_*.py
-class SimpleNoxWorker:
-    """Một lớp worker đơn giản để bao bọc các lệnh ADB và logging."""
+from minicap_stream import MinicapStreamParser
 
-    def __init__(self, adb_path, device_id, logger_func):
-        self.adb_path = adb_path
-        self.device_id = device_id
-        self.log = logger_func
-        self._abort = False
-
-    def adb(self, *args, timeout=6):
-        import subprocess
-        cmd = [self.adb_path, "-s", self.device_id, *args]
-        try_count = 3
-        for i in range(try_count):
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding='utf-8',
-                                   errors='ignore',
-                                   creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess,
-                                                                                        'CREATE_NO_WINDOW') else 0)
-                if p.returncode == 0:
-                    return p.returncode, p.stdout.strip(), p.stderr.strip()
-            except subprocess.TimeoutExpired:
-                if i == try_count - 1:
-                    return -1, "", "Timeout"
-            except Exception as e:
-                return -1, "", f"ERR:{e}"
-        return -1, "", "Failed after retries"
-
-
-# <<< BỔ SUNG: Hàm _ui_log để nhất quán với checkbox_actions.py
-def _ui_log(ctrl, device_id: str, msg: str):
-    """Gửi log ra giao diện chính."""
-    try:
-        ctrl.w.log_msg(f"[{device_id}] {msg}")
-    except Exception:
-        print(f"[{device_id}] {msg}")
-
-
-# <<< BỔ SUNG: Các hàm lập kế hoạch đã bị thiếu
-def _scan_eligible_accounts(accounts: list, features: dict) -> list:
-    """Quét và trả về danh sách các tài khoản đủ điều kiện chạy xây dựng/viễn chinh."""
-    eligible = []
-    now = datetime.now()
-    check_build = features.get("build", False)
-    check_expe = features.get("expe", False)
-
-    for acc in accounts:
-        try:
-            last_build_str = acc.get("last_build")
-            last_expe_str = acc.get("last_expe")
-            is_eligible = False
-
-            if check_build:
-                if not last_build_str or (now - datetime.fromisoformat(last_build_str)) > timedelta(hours=8.1):
-                    is_eligible = True
-
-            if not is_eligible and check_expe:
-                if not last_expe_str or (now - datetime.fromisoformat(last_expe_str)) > timedelta(hours=8.1):
-                    is_eligible = True
-
-            if is_eligible:
-                eligible.append(acc)
-        except Exception:
-            # Lỗi parse thời gian, coi như đủ điều kiện
-            eligible.append(acc)
-    return eligible
-
-
-def _plan_online_blessings(accounts: list, bless_config: dict, bless_targets: list, exclude_emails: list) -> dict:
-    """Lập kế hoạch chúc phúc, trả về dict {email: [target_emails]}."""
-    plan = {}
-    if not bless_config.get("enabled") or not bless_targets:
-        return {}
-
-    online_accounts = [acc for acc in accounts if acc.get("game_email") not in exclude_emails]
-    if not online_accounts:
-        return {}
-
-    num_targets_per_acc = bless_config.get("targets_per_blessing", 3)
-
-    for i, acc in enumerate(online_accounts):
-        email = acc.get("game_email")
-        # Chọn các target xoay vòng
-        start_index = (i * num_targets_per_acc) % len(bless_targets)
-        targets_for_this_acc = [bless_targets[j % len(bless_targets)] for j in
-                                range(start_index, start_index + num_targets_per_acc)]
-        plan[email] = targets_for_this_acc
-
-    return plan
+# Import các kịch bản auto (ví dụ)
+# Đảm bảo các file flows của bạn được import tại đây
+try:
+    from flows import example_flow
+except ImportError:
+    example_flow = None
 
 
 class CaptureThread(threading.Thread):
-    """Luồng chuyên dụng chỉ để lấy ảnh từ Minicap."""
+    """
+    "Người Quay Phim" (Producer) - Liên tục lấy khung hình từ Minicap.
+    """
 
-    def __init__(self, minicap_manager, frame_queue, stop_event):
-        super().__init__(daemon=True)
-        self.minicap = minicap_manager
-        self.frame_queue = frame_queue
-        self.stop_event = stop_event
+    def __init__(self, worker):
+        super().__init__(name=f"Capture-{worker.device_id}")
+        self.worker = worker
+        self.stream_parser = MinicapStreamParser(port=self.worker.minicap_port)
+        self.daemon = True
 
     def run(self):
-        while not self.stop_event.is_set():
-            frame = self.minicap.get_frame()
-            if frame is not None:
-                try:
-                    self.frame_queue.get_nowait()
-                except Empty:
-                    pass
-                self.frame_queue.put(frame)
+        logging.info(f"[{self.worker.device_id}] Bắt đầu CaptureThread.")
+
+        while not self.worker.stop_event.is_set():
+            # 1. Xử lý kết nối
+            if not self.stream_parser.socket:
+                if not self.stream_parser.connect():
+                    time.sleep(3)
+                    continue
+
+                logging.info(f"[{self.worker.device_id}] Đã thiết lập luồng Minicap.")
+
+            # 2. Lấy khung hình
+            # Hàm này bây giờ có timeout (xem minicap_stream.py) để phát hiện treo
+            frame_data_jpeg = self.stream_parser.get_next_frame()
+
+            # 3. Cập nhật Queue
+            if frame_data_jpeg:
+                self._update_queue(frame_data_jpeg)
             else:
-                if not self.stop_event.is_set():
-                    self.minicap.wk.log("Cảnh báo: Mất kết nối Minicap, đang thử kết nối lại...")
-                    # Thử khởi động lại stream một cách an toàn
-                    self.minicap.teardown()
-                    self.minicap.start_stream()
-                    time.sleep(2)
+                # Nếu trả về None, kết nối đã mất hoặc bị timeout. stream_parser đã tự đóng socket.
+                logging.warning(
+                    f"[{self.worker.device_id}] Mất kết nối hoặc Timeout luồng Minicap. Chuẩn bị kết nối lại.")
+                time.sleep(1)
+
+        self.stream_parser.close()
+        logging.info(f"[{self.worker.device_id}] Đã dừng CaptureThread.")
+
+    def _update_queue(self, frame_data):
+        """Đảm bảo hàng đợi luôn chỉ chứa khung hình mới nhất (Queue maxsize=1)."""
+        # 1. Xóa queue nếu nó đang đầy (để không bao giờ bị block)
+        try:
+            self.worker.frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        # 2. Đặt frame mới vào
+        try:
+            self.worker.frame_queue.put_nowait(frame_data)
+        except queue.Full:
+            pass
 
 
 class AutoThread(threading.Thread):
-    """Luồng chuyên dụng chỉ để chạy logic auto."""
+    """
+    "Đạo Diễn" (Consumer/AccountRunner) - Chứa logic auto.
+    """
 
-    def __init__(self, worker_instance):
-        super().__init__(daemon=True)
-        self.w = worker_instance
-        self.stop_event = worker_instance.stop_event
-        self.wk = self.w.wk
+    def __init__(self, worker):
+        super().__init__(name=f"Auto-{worker.device_id}")
+        self.worker = worker
 
     def run(self):
-        """Đây là nơi logic của lớp AccountRunner cũ được chuyển vào."""
-        self.w._sleep_coop(2)  # Chờ một chút để giao diện ổn định
+        logging.info(f"[{self.worker.device_id}] Bắt đầu AutoThread.")
 
-        while not self.stop_event.is_set():
-            try:
-                self.w.log("Đang làm mới danh sách tài khoản từ server...")
-                selected_ids = {acc.get('id') for acc in self.w.master_account_list}
-                all_accounts_fresh = self.w.cloud.get_game_accounts()
-                current_master_list = [acc for acc in all_accounts_fresh if acc.get('id') in selected_ids]
+        try:
+            # --- TÍCH HỢP LOGIC AUTO CỦA BẠN TẠI ĐÂY ---
+            # Giữ nguyên logic gọi các file flows của bạn.
 
-                if not current_master_list:
-                    self.w.log("Không có tài khoản nào được chọn. Tạm nghỉ 10 phút.")
-                    self.w._sleep_coop(600)
-                    continue
+            if example_flow:
+                # Truyền 'self.worker' vào để kịch bản sử dụng các hàm tương thích
+                example_flow.run(self.worker)
+            else:
+                logging.warning(
+                    f"[{self.worker.device_id}] Không có kịch bản auto mẫu. Tích hợp kịch bản chính của bạn tại đây.")
 
-                features = self.w._get_features()
-                eligible_for_build_expe = _scan_eligible_accounts(current_master_list, features)
-                emails_for_build_expe = {acc.get('game_email') for acc in eligible_for_build_expe}
+        except Exception as e:
+            logging.exception(f"[{self.worker.device_id}] Lỗi nghiêm trọng trong AutoThread: {e}")
 
-                bless_plan = {}
-                if features.get("bless"):
-                    bless_config = self.w.cloud.get_blessing_config()
-                    bless_targets = self.w.cloud.get_blessing_targets()
-                    bless_plan = _plan_online_blessings(current_master_list, bless_config, bless_targets,
-                                                        list(emails_for_build_expe))
-
-                all_emails_to_run = emails_for_build_expe.union(set(bless_plan.keys()))
-                if not all_emails_to_run:
-                    self.w.log("Không có tài khoản nào đủ điều kiện. Tạm nghỉ 1 giờ...")
-                    self.w._sleep_coop(3600)
-                    continue
-
-                accounts_to_run = sorted(
-                    [acc for acc in current_master_list if acc.get('game_email') in all_emails_to_run],
-                    key=lambda x: x.get('game_email'))
-                if self.w.current_account_index >= len(accounts_to_run):
-                    self.w.current_account_index = 0
-
-                rec = accounts_to_run[self.w.current_account_index]
-                self.w.current_account_index += 1
-
-                email = rec.get('game_email')
-                password = decrypt(rec.get("game_password_encrypted"), self.w.cloud.get_key())
-
-                self.w.log(f"Bắt đầu xử lý tài khoản: {email}")
-
-                # --- <<< BỔ SUNG: Logic thực thi tác vụ ---
-                # 1. Đăng nhập
-                login_ok = login_once(self.wk, email, password)
-                if not login_ok:
-                    self.w.log(f"Đăng nhập thất bại cho {email}, chuyển tài khoản tiếp theo.")
-                    logout_once(self.wk)  # Cố gắng thoát ra để chuẩn bị cho lần sau
-                    continue
-
-                # 2. Thực hiện các tác vụ
-                guild_name = self.w.cloud.get_guild_name_to_join()
-                join_guild_once(self.wk, guild_name)
-
-                if email in emails_for_build_expe:
-                    if features.get("build"):
-                        run_guild_build_flow(self.wk)
-                        self.w.cloud.update_account_ts(rec.get("id"), "build")
-                    if features.get("expe"):
-                        run_guild_expedition_flow(self.wk)
-                        self.w.cloud.update_account_ts(rec.get("id"), "expe")
-
-                if email in bless_plan:
-                    targets = bless_plan[email]
-                    run_bless_flow(self.wk, targets)
-
-                # 3. Đăng xuất
-                self.w.log(f"Hoàn thành tác vụ cho {email}, đang đăng xuất.")
-                logout_once(self.wk)
-                self.w._sleep_coop(5)  # Nghỉ 5 giây giữa các tài khoản
-
-            except Exception as e:
-                import traceback
-                self.w.log(f"Lỗi nghiêm trọng trong luồng auto: {e}\n{traceback.format_exc()}")
-                self.w._sleep_coop(300)
-
-    def stop(self):
-        self.stop_event.set()
-        setattr(self.wk, "_abort", True)
+        finally:
+            # Khi luồng Auto kết thúc, ra hiệu lệnh dừng toàn bộ worker
+            logging.info(f"[{self.worker.device_id}] Hoàn thành AutoThread. Ra hiệu lệnh dừng Worker.")
+            self.worker.stop()
 
 
-class Worker:
-    """Lớp quản lý chính, điều phối các luồng."""
+class DeviceWorker:
+    """
+    Quản lý các luồng và cung cấp các hàm tương thích cho Flows.
+    """
 
-    def __init__(self, ctrl, device_id, adb_path, cloud, accounts, user_login_email):
-        self.ctrl = ctrl
+    def __init__(self, device_id, minicap_port=1313, resize_to_config=False):
         self.device_id = device_id
-        self.cloud = cloud
-        self.master_account_list = list(accounts)
-        self.user_login_email = user_login_email
-        self.current_account_index = 0
+        self.minicap_port = minicap_port
+        self.resize_to_config = resize_to_config  # Tùy chọn để bật/tắt resize
 
-        self.wk = SimpleNoxWorker(adb_path, device_id, self.log)
-        self.minicap = MinicapManager(self.wk)
-
-        self.frame_queue = Queue(maxsize=1)
+        # Tài nguyên dùng chung
+        self.frame_queue = queue.Queue(maxsize=1)  # "Hòm thư"
         self.stop_event = threading.Event()
 
+        # Các luồng và tiến trình
         self.capture_thread = None
         self.auto_thread = None
+        self.minicap_process = None
 
-    def log(self, msg: str):
-        _ui_log(self.ctrl, self.device_id, msg)
+        # Lưu độ phân giải thực tế (dùng cho việc scale tọa độ nếu resize_to_config=True)
+        self.real_resolution = (None, None)
 
     def start(self):
-        self.log("Worker đang khởi động...")
-        if not self.minicap.setup() or not self.minicap.start_stream():
-            self.log("KHỞI ĐỘNG MINICAP THẤT BẠI. Không thể bắt đầu auto.")
-            self.minicap.teardown()
-            return False
+        logging.info(f"Khởi động Worker cho thiết bị {self.device_id} (Cổng: {self.minicap_port})...")
 
-        setattr(self.wk, "grab_screen_np", self.get_latest_frame)
-        setattr(self.wk, "_abort", False)
+        # 1. Khởi tạo Minicap
+        if not self._initialize_minicap():
+            logging.error(f"[{self.device_id}] Không thể khởi tạo Minicap. Dừng Worker.")
+            self.stop()
+            return
 
-        self.capture_thread = CaptureThread(self.minicap, self.frame_queue, self.stop_event)
-        self.auto_thread = AutoThread(self)
-
+        # 2. Bắt đầu CaptureThread
+        self.capture_thread = CaptureThread(self)
         self.capture_thread.start()
+
+        # 3. Chờ khung hình đầu tiên
+        if not self._wait_for_first_frame():
+            logging.error(f"[{self.device_id}] Timeout hoặc lỗi khi chờ khung hình đầu tiên. Dừng Worker.")
+            self.stop()
+            return
+
+        # 4. Bắt đầu AutoThread
+        self.auto_thread = AutoThread(self)
         self.auto_thread.start()
 
-        self.log("Worker đã khởi động thành công.")
+    def _initialize_minicap(self):
+        # Dọn dẹp các phiên cũ
+        adb_utils.stop_minicap(self.device_id)
+        adb_utils.remove_forward(self.device_id, self.minicap_port)
+
+        # Lấy độ phân giải thực tế
+        self.real_resolution = adb_utils.get_resolution(self.device_id)
+        if self.real_resolution[0] is None:
+            return False
+
+        # Forward cổng
+        if adb_utils.forward_port(self.device_id, self.minicap_port) is None:
+            return False
+
+        # Khởi động dịch vụ Minicap (Hàm start_minicap sử dụng độ phân giải thực tế)
+        self.minicap_process = adb_utils.start_minicap(self.device_id)
+        if self.minicap_process is None:
+            adb_utils.remove_forward(self.device_id, self.minicap_port)
+            return False
+
         return True
+
+    def _wait_for_first_frame(self, timeout=15):
+        logging.info(f"[{self.device_id}] Đang chờ khung hình đầu tiên...")
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if not self.frame_queue.empty():
+                logging.info(f"[{self.device_id}] Đã nhận khung hình đầu tiên. Hệ thống sẵn sàng.")
+                return True
+
+            if self.capture_thread and not self.capture_thread.is_alive():
+                logging.error(f"[{self.device_id}] CaptureThread đã dừng đột ngột.")
+                return False
+
+            if self.stop_event.is_set():
+                return False
+            time.sleep(0.1)
+        return False
 
     def stop(self):
-        self.log("Đang gửi yêu cầu dừng đến các luồng...")
+        # Đảm bảo hàm stop chỉ chạy một lần
+        if self.stop_event.is_set():
+            return
+
+        logging.info(f"Dừng Worker cho thiết bị {self.device_id}...")
         self.stop_event.set()
 
-        if self.auto_thread:
-            setattr(self.wk, "_abort", True)
+        # CẬP NHẬT: Lấy thông tin luồng hiện tại để tránh lỗi "cannot join current thread"
+        current_thread = threading.current_thread()
+
+        # Chờ các luồng kết thúc
+        # Chỉ join nếu luồng đang sống VÀ nó không phải là luồng hiện tại
+        if self.auto_thread and self.auto_thread.is_alive() and self.auto_thread != current_thread:
+            logging.debug(f"[{self.device_id}] Chờ AutoThread kết thúc...")
             self.auto_thread.join(timeout=5)
-        if self.capture_thread:
+
+        if self.capture_thread and self.capture_thread.is_alive() and self.capture_thread != current_thread:
+            logging.debug(f"[{self.device_id}] Chờ CaptureThread kết thúc...")
             self.capture_thread.join(timeout=5)
 
-        self.minicap.teardown()
-        self.log("Worker đã dừng hoàn toàn.")
+        # Dọn dẹp tài nguyên (Luôn thực hiện)
+        if self.minicap_process:
+            self.minicap_process.terminate()
+            try:
+                self.minicap_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.minicap_process.kill()
 
-    def get_latest_frame(self, wk_instance=None) -> np.ndarray | None:
-        try:
-            return self.frame_queue.get(timeout=5.0)  # Chờ tối đa 5s để có ảnh mới
-        except Empty:
-            self.log("Cảnh báo: Không nhận được frame mới từ CaptureThread trong 5 giây.")
+        adb_utils.stop_minicap(self.device_id)
+        adb_utils.remove_forward(self.device_id, self.minicap_port)
+
+        logging.info(f"Worker cho thiết bị {self.device_id} đã dừng hoàn toàn.")
+
+    # --- Lớp Tương Thích (API cho các file flows_*.py) ---
+
+    def grab_screen_np(self, timeout=5):
+        """
+        (Tương thích flows cũ) Lấy ảnh màn hình mới nhất từ Queue.
+        """
+        if self.stop_event.is_set():
             return None
 
-    def _get_features(self):
-        return self.ctrl.w.get_features()  # Lấy features từ MainWindow
+        try:
+            # Lấy dữ liệu JPEG từ Queue (Rất nhanh)
+            # Timeout này là thời gian tối đa AutoThread chờ CaptureThread cung cấp ảnh mới.
+            frame_data_jpeg = self.frame_queue.get(block=True, timeout=timeout)
 
-    def _sleep_coop(self, secs):
-        end_time = time.time() + secs
-        while time.time() < end_time:
-            if self.stop_event.is_set(): return False
-            time.sleep(min(1.0, end_time - time.time()))
-        return True
+            # Giải mã JPEG thành NumPy array (OpenCV BGR format)
+            image_np = cv2.imdecode(np.frombuffer(frame_data_jpeg, np.uint8), cv2.IMREAD_COLOR)
+
+            if image_np is None:
+                logging.warning(f"[{self.device_id}] Không thể giải mã khung hình.")
+                return None
+
+            # Xử lý Resize để tương thích với flows cũ
+            if self.resize_to_config:
+                target_w, target_h = config.SCREEN_W, config.SCREEN_H
+                # Kiểm tra xem có cần resize không (tránh resize nếu kích thước đã khớp)
+                if image_np.shape[1] != target_w or image_np.shape[0] != target_h:
+                    image_np = cv2.resize(image_np, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+            return image_np
+
+        except queue.Empty:
+            # Lỗi này xảy ra nếu AutoThread không nhận được ảnh trong vòng 'timeout' giây.
+            logging.error(
+                f"[{self.device_id}] Timeout ({timeout}s) khi chờ ảnh màn hình. CaptureThread có thể đang gặp sự cố hoặc đang kết nối lại.")
+
+            # CẬP NHẬT: Không gọi self.stop() tại đây. Chỉ trả về None và để kịch bản (flows) quyết định.
+            # Điều này cho phép CaptureThread có thời gian tự phục hồi (kết nối lại).
+            return None
+        except Exception as e:
+            logging.error(f"[{self.device_id}] Lỗi không mong muốn trong grab_screen_np: {e}")
+            return None
+
+    def _scale_coords(self, x, y):
+        """Chuyển đổi tọa độ từ kích thước config sang kích thước thực tế nếu đang bật resize."""
+        if not self.resize_to_config or self.real_resolution[0] is None:
+            return x, y
+
+        real_w, real_h = self.real_resolution
+        config_w, config_h = config.SCREEN_W, config.SCREEN_H
+
+        if config_w == 0 or config_h == 0: return x, y
+
+        scale_x = real_w / config_w
+        scale_y = real_h / config_h
+
+        return int(x * scale_x), int(y * scale_y)
+
+    def tap(self, x, y):
+        if self.stop_event.is_set(): return
+        scaled_x, scaled_y = self._scale_coords(x, y)
+        adb_utils.tap(self.device_id, scaled_x, scaled_y)
+
+    def swipe(self, x1, y1, x2, y2, duration=300):
+        if self.stop_event.is_set(): return
+        scaled_x1, scaled_y1 = self._scale_coords(x1, y1)
+        scaled_x2, scaled_y2 = self._scale_coords(x2, y2)
+        adb_utils.swipe(self.device_id, scaled_x1, scaled_y1, scaled_x2, scaled_y2, duration)
+
+    # Các hàm tiện ích khác (ví dụ)
+    def find_template(self, template_name, threshold=0.8):
+        screen = self.grab_screen_np()
+        if screen is None:
+            return None
+        template = image_utils.load_template(template_name)
+        return image_utils.find_template(screen, template, threshold)
+
+    def click_on_template(self, template_name, threshold=0.8, max_attempts=3, delay=1):
+        """Tìm kiếm và click vào template."""
+        for attempt in range(max_attempts):
+            if self.stop_event.is_set():
+                return False
+
+            coords = self.find_template(template_name, threshold)
+            if coords:
+                logging.info(f"[{self.device_id}] Đã tìm thấy '{template_name}' tại {coords}. Đang click.")
+                self.tap(coords[0], coords[1])
+                return True
+
+            # Nếu không lấy được ảnh (coords=None) và queue đang rỗng, có thể CaptureThread đang gặp sự cố.
+            if coords is None and self.frame_queue.empty():
+                logging.info(f"[{self.device_id}] Chờ đợi thêm do Queue ảnh đang rỗng.")
+                time.sleep(max(delay, 2))  # Chờ lâu hơn một chút
+            else:
+                time.sleep(delay)
+        return False

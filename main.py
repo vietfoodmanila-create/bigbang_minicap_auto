@@ -1,113 +1,81 @@
-# main.py
-# Phiên bản mới, thiết lập môi trường và khởi chạy ứng dụng một cách an toàn.
-
-import sys
+import logging
+import time
+from worker import DeviceWorker
+import adb_utils
 import os
-import socket
-import subprocess
-from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
-from PySide6.QtCore import Qt
-
-# Import các thành phần của ứng dụng
-import config
-from module import resource_path
-from ui_main import MainWindow
-from ui_auth import CloudClient, AuthDialog
+# Cấu hình logging
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
 
-# --- CÁC HÀM TIỆN ÍCH KHỞI ĐỘNG ---
+def main():
+    logging.info("Bắt đầu chương trình Automation (Kiến trúc mới).")
 
-def get_bundled_adb_path() -> str:
-    """
-    Lấy đường dẫn tuyệt đối đến tệp adb.exe đi kèm trong thư mục vendor.
-    Hoạt động cho cả chế độ phát triển và khi đã đóng gói bằng PyInstaller.
-    """
-    return resource_path(os.path.join("vendor", "adb.exe"))
+    # Kiểm tra sự tồn tại của ADB đã cấu hình
+    if not os.path.exists(adb_utils.ADB_EXECUTABLE):
+        logging.error(f"Dừng chương trình: Không tìm thấy ADB tại {adb_utils.ADB_EXECUTABLE}")
+        return
 
+    print("\nLƯU Ý: Đảm bảo Minicap binaries (/data/local/tmp/minicap và minicap.so) đã được cài đặt trên thiết bị.\n")
 
-def force_kill_adb_server():
-    """Dừng tất cả các tiến trình adb.exe đang chạy để đảm bảo sự ổn định."""
+    # Lấy danh sách thiết bị (sử dụng logic trong adb_utils)
+    devices = adb_utils.get_device_list()
+    if not devices:
+        logging.error("Không tìm thấy thiết bị nào được kết nối. Vui lòng kiểm tra kết nối và cấu hình giả lập.")
+        return
+
+    logging.info(f"Tìm thấy {len(devices)} thiết bị: {devices}")
+
+    workers = []
+    base_port = 1717  # Cổng local bắt đầu cho Minicap
+
+    # CẤU HÌNH QUAN TRỌNG:
+    # Nếu flows cũ của bạn phụ thuộc vào kích thước cố định trong config.py (900x1600), đặt RESIZE = True.
+    # Nếu flows cũ của bạn sử dụng độ phân giải thực tế của thiết bị, đặt RESIZE = False.
+    RESIZE = False
+
+    # Khởi động Worker cho từng thiết bị
+    for i, device_id in enumerate(devices):
+        port = base_port + i
+        worker = DeviceWorker(device_id, minicap_port=port, resize_to_config=RESIZE)
+        worker.start()
+        workers.append(worker)
+        # Khởi động tuần tự
+        time.sleep(1)
+
+        # Chờ cho đến khi tất cả các worker hoàn thành công việc hoặc bị ngắt
     try:
-        print("Đang buộc dừng tất cả các tiến trình adb.exe...")
-        # Lệnh taskkill của Windows mạnh hơn adb kill-server
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "adb.exe"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        print("OK: Đã dọn dẹp các tiến trình ADB cũ.")
-    except Exception:
-        # Nếu thất bại, thử dùng lệnh của ADB
-        try:
-            print("Không tìm thấy taskkill, đang dùng adb kill-server...")
-            subprocess.run([config.PLATFORM_TOOLS_ADB_PATH, "kill-server"], timeout=5)
-        except Exception as e:
-            print(f"Lưu ý: Không thể dừng ADB server. Lỗi: {e}")
+        while True:
+            all_done = True
+            for w in workers:
+                # Nếu luồng auto đang chạy, chúng ta chưa xong
+                if w.auto_thread and w.auto_thread.is_alive():
+                    all_done = False
+                    break
+                # Nếu luồng auto chưa khởi động và cũng chưa có lệnh dừng
+                if w.auto_thread is None and not w.stop_event.is_set():
+                    all_done = False
+                    break
+
+            if all_done:
+                logging.info("Tất cả các worker đã hoàn thành công việc hoặc dừng lại.")
+                break
+
+            time.sleep(2)
+    except KeyboardInterrupt:
+        logging.info("Nhận được tín hiệu ngắt (Ctrl+C). Đang dừng tất cả các worker...")
+        # Ra lệnh dừng cho tất cả
+        for worker in workers:
+            worker.stop()
+
+    # Đảm bảo tất cả worker đã được dọn dẹp hoàn toàn
+    for worker in workers:
+        worker.stop()
+
+    logging.info("Chương trình kết thúc.")
 
 
-def check_for_updates(cloud_client):
-    """Kiểm tra và xử lý cập nhật."""
-    # (Giữ nguyên logic kiểm tra cập nhật của bạn ở đây)
-    return False  # Tạm thời tắt
-
-
-# --- CẬP NHẬT CẤU HÌNH TỰ ĐỘNG ---
-# Ghi đè biến trong config bằng đường dẫn ADB đi kèm phần mềm.
-config.PLATFORM_TOOLS_ADB_PATH = get_bundled_adb_path()
-print(f"Đã tự động cấu hình ADB path: {config.PLATFORM_TOOLS_ADB_PATH}")
-
-# --- ĐIỂM BẮT ĐẦU CHƯƠNG TRÌNH ---
 if __name__ == "__main__":
-    # --- CƠ CHẾ CHẶN KHỞI ĐỘNG NHIỀU LẦN ---
-    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        lock_socket.bind(("127.0.0.1", 60101))
-    except OSError:
-        error_app = QApplication.instance() or QApplication(sys.argv)
-        QMessageBox.critical(
-            None, "Lỗi Khởi Động",
-            "Chương trình BigBang Auto đã được khởi động."
-        )
-        sys.exit(1)
-    # --- KẾT THÚC CƠ CHẾ CHẶN ---
-
-    force_kill_adb_server()
-
-    os.environ.setdefault("QT_QPA_PLATFORM", "windows")
-    app = QApplication(sys.argv)
-    cloud = CloudClient()
-
-    # --- LOGIC ĐĂNG NHẬP ---
-    td = cloud.load_token()
-    if not td or not td.token:
-        dlg = AuthDialog()
-        if dlg.exec() != QDialog.Accepted:
-            sys.exit(0)
-        cloud = dlg.cloud
-
-    # --- KHỞI TẠO CÁC THÀNH PHẦN CHÍNH ---
-    import checkbox_actions
-    from ui_main import AppController  # Import AppController từ ui_main
-
-    win = MainWindow(cloud=cloud)
-    ctrl = AppController(win)  # AppController giờ nằm trong ui_main
-
-    try:
-        from ui_license import attach_license_system
-
-        lic_ctrl = attach_license_system(win, cloud)
-        win._license_controller = lic_ctrl
-    except Exception as e:
-        print(f"attach_license_system failed: {e}")
-
-    # Hiển thị cửa sổ chính trước
-    win.show()
-
-    # Sau đó mới kiểm tra cập nhật
-    if check_for_updates(cloud):
-        sys.exit(0)
-
-    # Bắt đầu vòng lặp sự kiện của ứng dụng
-    sys.exit(app.exec())
+    # Yêu cầu cài đặt: pip install opencv-python numpy
+    main()
