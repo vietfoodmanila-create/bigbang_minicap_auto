@@ -40,56 +40,77 @@ def _table_row_for_device_id(ctrl, device_id: str) -> int:  # Sửa: Tìm theo d
     return -1
 
 
-def _plan_online_blessings(accounts_selected: List[Dict], config: Dict, targets: List[Dict],
-                           accounts_already_running: List[str]) -> Dict[str, List[Dict]]:
+def _plan_online_blessings(
+    accounts_selected: List[Dict],
+    config: Dict,
+    targets: List[Dict],
+    accounts_already_running: List[str]
+) -> Dict[str, List[Dict]]:
     """
-    (CẬP NHẬT) Lập kế hoạch Chúc phúc dựa trên số lượt đã chạy trong ngày.
+    Lập kế hoạch Chúc phúc đúng semantics:
+      - Server trả sẵn các target 'đến hạn' / 'chưa đủ trong chu kỳ' + 'cycle_count'.
+      - Mỗi target cần thêm (per_run - cycle_count) tài khoản khác nhau trong CHU KỲ.
+      - Một account không được chúc cùng target > 1 lần trong NGÀY.
+      - Một account tối đa 20 lượt/ngày (tổng mọi target).
+    Trả về: { email_account: [ {id, name}, ... ] }
     """
-    plan = {}
-    per_run = config.get('per_run', 0)
-    cooldown_h = config.get('cooldown_hours', 0)
+    def _normalize_emails(items) -> List[str]:
+        res: List[str] = []
+        for x in (items or []):
+            if isinstance(x, dict):
+                e = x.get('email') or x.get('game_email')
+                if e: res.append(str(e))
+            elif x:
+                res.append(str(x))
+        return res
+
+    plan: Dict[str, List[Dict]] = {}
+    per_run = int(config.get('per_run') or 0)
     if per_run <= 0 or not targets or not accounts_selected:
-        return {}
+        return plan
 
-    now = datetime.now()
+    # Ưu tiên các account đã có nhiệm vụ build/expe
+    priority = [e for e in accounts_already_running if e]
+    others   = [a.get('game_email') for a in accounts_selected if a.get('game_email') and a.get('game_email') not in priority]
+    email_order = priority + others
 
-    # 1. Lọc các mục tiêu cần chúc phúc trong lượt này
-    due_targets = []
-    for target in targets:
-        blessed_today_count = len(target.get('blessed_today_by', []))
+    # Tổng số lượt/ngày của từng email (trên mọi target)
+    used_today: Dict[str, int] = {}
+    for t in targets:
+        for e in set(_normalize_emails(t.get('blessed_today_by'))):
+            used_today[e] = used_today.get(e, 0) + 1
 
-        # Nếu chưa đủ số lượt yêu cầu -> mục tiêu này vẫn "due"
-        if blessed_today_count < per_run:
-            last_run_dt = _parse_datetime_str(target.get('last_blessed_run_at'))
-            # Nếu đã hết cooldown HOẶC đây là lần chúc phúc đầu tiên trong ngày -> hợp lệ
-            if not last_run_dt or (now - last_run_dt) >= timedelta(hours=cooldown_h) or blessed_today_count > 0:
-                due_targets.append(target)
+    # Phân bổ theo từng target
+    for t in targets:
+        try:
+            tid = int(t.get('id'))
+        except Exception:
+            continue
+        tname        = t.get('target_name') or t.get('name') or ""
+        cycle_count  = int(t.get('cycle_count') or 0)
+        need         = per_run - cycle_count
+        if need <= 0:
+            continue
 
-    if not due_targets:
-        return {}
+        blessed_today = set(_normalize_emails(t.get('blessed_today_by')))
 
-    # 2. Danh sách các tài khoản có thể chúc phúc, ưu tiên những tài khoản đã có nhiệm vụ
-    priority_emails = [email for email in accounts_already_running]
-    other_emails = [acc.get('game_email') for acc in accounts_selected if acc.get('game_email') not in priority_emails]
-    available_emails = priority_emails + other_emails
+        for email in email_order:
+            if need <= 0:
+                break
+            if not email:
+                continue
+            if email in blessed_today:
+                continue
+            if used_today.get(email, 0) >= 20:
+                continue
 
-    # 3. Phân bổ
-    for target in due_targets:
-        blessed_today_emails = {item.get('game_email') for item in target.get('blessed_today_by', [])}
-        needed = per_run - len(blessed_today_emails)
-        if needed <= 0: continue
+            plan.setdefault(email, []).append({'id': tid, 'name': tname})
+            used_today[email] = used_today.get(email, 0) + 1
+            blessed_today.add(email)   # tránh gán trùng trong chính kế hoạch
+            need -= 1
 
-        for email in available_emails:
-            if needed <= 0: break
-            if email not in blessed_today_emails:
-                if email not in plan: plan[email] = []
-                # Đảm bảo không gán trùng lặp trong cùng một kế hoạch
-                if not any(t['id'] == target['id'] for t in plan[email]):
-                    plan[email].append({'id': target['id'], 'name': target.get('target_name')})
-                    # Giả lập đã thêm để không bị gán lại trong cùng 1 lần quét
-                    blessed_today_emails.add(email)
-                    needed -= 1
     return plan
+
 
 
 def _get_ui_state(ctrl, row: int) -> str:
@@ -358,7 +379,7 @@ class AccountRunner(QObject, threading.Thread):
                         if bless_plan:
                             self.log(f"Đã lập kế hoạch Chúc phúc cho {len(bless_plan)} tài khoản.")
                     except Exception as e:
-                        self.log(f"Lỗi lập kế hoạch Chúc phúc: {e}")
+                        self.log(f"Lỗi lập kế hoạch Chúc phúc: {type(e).__name__}: {e!r}")
 
                 # Bước 3: Tổng hợp danh sách và kiểm tra
                 emails_for_bless = set(bless_plan.keys())
@@ -427,7 +448,20 @@ class AccountRunner(QObject, threading.Thread):
                                         self.cloud.record_blessing(target_info['id'], account_id)
                                         self.log(f"📝 [API] Đã ghi lại lịch sử Chúc phúc cho '{name}'.")
                                     except Exception as e:
-                                        self.log(f"⚠️ [API] Lỗi ghi lịch sử Chúc phúc: {e}")
+                                        err = None
+                                        try:
+                                            r = getattr(e, "response", None)
+                                            if r is not None:
+                                                j = r.json()
+                                                err = j.get("error")
+                                        except Exception:
+                                            pass
+
+                                        if err in ("cycle_quota_reached", "already_blessed_today",
+                                                   "daily_quota_reached"):
+                                            self.log(f"[API] Bỏ qua ghi lịch sử: {err}")
+                                        else:
+                                            self.log(f"[API] Lỗi ghi lịch sử: {e}")
                                     break
 
                 if email in emails_for_build_expe:

@@ -38,6 +38,9 @@ from PySide6.QtWidgets import (
 from ui_auth import CloudClient
 from ui_license import AccountBanner
 from utils_crypto import encrypt
+from ui_verify_game_login import VerifyGameLoginDialog
+from ui_verify_game_login_webonly import VerifyGameLoginWebOnlyDialog
+
 
 # ====== Cấu hình (SỬA ĐỔI) ======
 # Import thêm các biến mới từ config.py
@@ -355,7 +358,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([250, 670])
 
         self.tbl_nox.itemSelectionChanged.connect(self.on_nox_selection_changed)
-        self.btn_acc_add.clicked.connect(self.on_add_account);
+        self.btn_acc_add.clicked.connect(self.on_add_account_clicked);
         self.btn_acc_refresh.clicked.connect(self.load_and_sync_accounts);
         self.chk_select_all_accs.toggled.connect(self.on_select_all_accounts)
 
@@ -503,82 +506,243 @@ class MainWindow(QMainWindow):
 
         self.log_msg(f"Đã hiển thị {len(self.online_accounts)} tài khoản.")
 
-    def on_add_account(self):
-        dialog = AccountDialog(parent=self)
-        if dialog.exec() == QDialog.Accepted:
-            new_data = dialog.get_data();
-            email = new_data.get("game_email");
-            password = new_data.get("game_password")
-            if not email or not password: QMessageBox.warning(self, "Thiếu thông tin",
-                                                              "Vui lòng nhập đầy đủ email và mật khẩu."); return
-            existing_emails = [acc.get('game_email', '').lower() for acc in self.online_accounts]
-            if email.lower() in existing_emails:
-                QMessageBox.warning(self, "Tài khoản đã tồn tại", f"Tài khoản '{email}' đã có trong danh sách của bạn.")
-                self.log_msg(f"Thao tác thêm bị hủy: tài khoản {email} đã tồn tại.");
+    def on_add_account_clicked(self):
+        dlg = VerifyGameLoginDialog(parent=self, default_mode="FORM")  # hoặc "WEB" nếu bạn muốn mặc định
+        if dlg.exec() != QDialog.Accepted:
+            return
+        verified = dlg.get_verified_data()
+        if not verified:
+            QMessageBox.warning(self, "Chưa xác minh", "Bạn chưa hoàn tất đăng nhập thành công.")
+            return
+
+        email = verified.get("game_email", "")
+        password = verified.get("game_password", "")
+        server = verified.get("server", "")
+
+        if not email or not password:
+            QMessageBox.warning(self, "Thiếu thông tin", "Thiếu email hoặc mật khẩu sau xác minh.")
+            return
+
+        existing_emails = [acc.get('game_email', '').lower() for acc in getattr(self, "online_accounts", [])]
+        if email.lower() in existing_emails:
+            QMessageBox.warning(self, "Tài khoản đã tồn tại", f"Tài khoản '{email}' đã có trong danh sách.")
+            self.log_msg(f"Thêm bị hủy: {email} đã tồn tại.")
+            return
+
+        try:
+            token_data = self.cloud.load_token()
+            user_login_email = getattr(token_data, "email", None) if token_data else None
+            if not user_login_email:
+                QMessageBox.critical(self, "Lỗi", "Không tìm thấy email người dùng để tạo khóa mã hóa.")
                 return
-            self.log_msg(f"Đang mở trình duyệt để xác thực tài khoản {email}...")
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            success, message = check_game_login_client_side(email, password)
-            QApplication.restoreOverrideCursor()
-            if not success: self.log_msg(f"Xác thực thất bại: {message}"); QMessageBox.critical(self,
-                                                                                                "Xác thực thất bại",
-                                                                                                message); return
-            self.log_msg("Xác thực thành công! Đang mã hóa và gửi dữ liệu lên server...")
+
+            encrypted_password = encrypt(password, user_login_email)
+            data_to_send = {"game_email": email, "game_password": encrypted_password, "server": server or None}
+
+            self.log_msg("Xác minh OK. Mã hoá & gửi dữ liệu lên server…")
+            self.cloud.add_game_account(data_to_send)
+
+            self.log_msg("Thêm tài khoản thành công. Đang đồng bộ…")
+            self.load_and_sync_accounts()
+
+        except Exception as e:
+            self.log_msg(f"Lỗi khi thêm tài khoản: {e}")
+            QMessageBox.critical(self, "Lỗi API", f"Không thể thêm tài khoản:\n{e}")
+
+    def open_game_web_login(self, parent):
+        """
+        Mở lại dialog đăng nhập game (giống khi Thêm tài khoản) và trả về:
+          { "ok": bool, "email": str|None, "password": str|None, "message": str }
+        Chỉ phục vụ việc xác thực lại mật khẩu mới (client-side).
+        """
+        from PySide6 import QtWidgets
+
+        # Tìm dialog thêm tài khoản mà bạn đang dùng (giữ nguyên logic gốc)
+        try:
+            # Nếu AccountDialog ở module khác, đảm bảo đã import ở đầu file ui_main.py
+            dlg = AccountDialog(parent=parent)
+        except NameError:
+            QtWidgets.QMessageBox.critical(parent if isinstance(parent, QtWidgets.QWidget) else None,
+                                           "Thiếu AccountDialog",
+                                           "Không tìm thấy AccountDialog. Vui lòng import hoặc điều chỉnh tên lớp.")
+            return {"ok": False, "email": None, "password": None, "message": "AccountDialog không khả dụng"}
+
+        # Nếu dialog của bạn có API đặt chế độ "login-only" thì tận dụng (không bắt buộc)
+        if hasattr(dlg, "set_mode"):
             try:
-                user_login_email = self.cloud.load_token().email
-                if not user_login_email: QMessageBox.critical(self, "Lỗi",
-                                                              "Không tìm thấy email người dùng để tạo khóa mã hóa."); return
-                encrypted_password = encrypt(password, user_login_email)
-                data_to_send = {"game_email": email, "game_password": encrypted_password,
-                                "server": new_data.get("server")}
-                self.cloud.add_game_account(data_to_send)
-                self.log_msg("Thêm tài khoản thành công! Đang làm mới và đồng bộ...");
-                self.load_and_sync_accounts()
-            except Exception as e:
-                self.log_msg(f"Lỗi khi thêm tài khoản vào hệ thống: {e}");
-                QMessageBox.critical(self, "Lỗi API",
-                                     f"Không thể thêm tài khoản vào hệ thống:\n{e}")
+                dlg.set_mode("login_only")
+            except Exception:
+                pass
+
+        # Gợi ý: nếu biết email đang sửa, có thể prefill (tuỳ AccountDialog có hỗ trợ hay không)
+        expected_email = None
+        try:
+            expected_email = getattr(parent, "account", {}).get("game_email")
+        except Exception:
+            expected_email = None
+        if expected_email and hasattr(dlg, "prefill_email"):
+            try:
+                dlg.prefill_email(expected_email)
+            except Exception:
+                pass
+
+        rc = dlg.exec()
+        if rc == QtWidgets.QDialog.Accepted:
+            # Dùng đúng API cũ của bạn để lấy dữ liệu
+            try:
+                data = dlg.get_data()
+            except Exception:
+                data = {}
+            email = (data.get("game_email") or "").strip()
+            password = data.get("game_password")
+            if email and password:
+                return {"ok": True, "email": email, "password": password, "message": ""}
+            return {"ok": False, "email": email or None, "password": None, "message": "Thiếu email hoặc mật khẩu."}
+
+        return {"ok": False, "email": None, "password": None, "message": "Hủy bởi người dùng."}
+
+    def on_add_account_clicked(self):
+        # Yêu cầu đã đăng nhập Cloud trước (self.cloud)
+        dlg = VerifyGameLoginWebOnlyDialog(self.cloud, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dlg.get_verified_payload()
+        if not data:
+            QMessageBox.warning(self, "Chưa xác minh", "Bạn chưa hoàn tất đăng nhập.")
+            return
+
+        email = data.get("game_email") or ""  # có thể rỗng nếu trang không in email
+        password = data.get("game_password") or ""
+        server_id = data.get("server_id")
+
+        if not password or not server_id:
+            QMessageBox.warning(self, "Thiếu dữ liệu", "Thiếu mật khẩu hoặc server.")
+            return
+
+        # Nếu không bắt được email từ web, hỏi người dùng xác nhận email sẽ lưu
+        if not email:
+            email, ok = QInputDialog.getText(self, "Nhập email game", "Email dùng để đăng nhập:")
+            if not ok or not email.strip():
+                return
+            email = email.strip()
+
+        existing_emails = [acc.get('game_email', '').lower() for acc in getattr(self, "online_accounts", [])]
+        if email.lower() in existing_emails:
+            QMessageBox.warning(self, "Tài khoản đã tồn tại", f"Tài khoản '{email}' đã có trong danh sách.")
+            self.log_msg(f"Huỷ thêm: {email} đã tồn tại.")
+            return
+
+        try:
+            token_data = self.cloud.load_token()
+            owner_email = getattr(token_data, "email", None) if token_data else None
+            if not owner_email:
+                QMessageBox.critical(self, "Lỗi", "Không tìm thấy email người dùng để tạo khoá mã hoá.")
+                return
+
+            encrypted = encrypt(password, owner_email)
+            payload = {"game_email": email, "game_password": encrypted, "server_id": server_id}
+
+            self.log_msg("Đăng nhập web OK. Đang mã hoá và gửi lên server…")
+            self.cloud.add_game_account(payload)  # giữ nguyên method cũ, chỉ khác payload có server_id
+
+            self.log_msg("Thêm tài khoản thành công. Làm mới danh sách…")
+            self.load_and_sync_accounts()
+        except Exception as e:
+            self.log_msg(f"Lỗi thêm tài khoản: {e}")
+            QMessageBox.critical(self, "Lỗi API", f"Không thể thêm tài khoản:\n{e}")
 
     def on_info_account(self, row):
+        from datetime import datetime
         account = self.online_accounts[row]
 
-        def fmt_dt(s): return datetime.fromisoformat(s).strftime('%d/%m/%Y %H:%M:%S') if s else "N/A"
+        def fmt_dt(s):
+            try:
+                return datetime.fromisoformat(s).strftime('%d/%m/%Y %H:%M:%S') if s else "N/A"
+            except Exception:
+                return s or "N/A"
 
-        def fmt_d(s): return datetime.fromisoformat(s).strftime('%d/%m/%Y') if s else "N/A"
+        def fmt_d(s):
+            try:
+                return datetime.fromisoformat(s).strftime('%d/%m/%Y') if s else "N/A"
+            except Exception:
+                return s or "N/A"
+
+        server_name = account.get('server_name') or account.get('server') or "N/A"
+        server_id = account.get('server_id')
+        server_line = f"{server_name}" if server_id else server_name
+
+        status = str(account.get('status', 'N/A'))
+        color = 'green' if status.lower() == 'ok' else 'red'
 
         info = (
-            f"<b>Email:</b> {account.get('game_email', 'N/A')}<br>"f"<b>Server:</b> {account.get('server', 'N/A')}<br>"f"<b>Trạng thái:</b> <span style='color:green;'>{account.get('status', 'N/A')}</span><br><br>"f"<b>Xây dựng cuối:</b> {fmt_d(account.get('last_build_date'))}<br>"f"<b>Viễn chinh cuối:</b> {fmt_dt(account.get('last_expedition_time'))}<br>"f"<b>Rời LM cuối:</b> {fmt_dt(account.get('last_leave_time'))}<br>"f"<b>Chúc phúc:</b> {account.get('last_bless_info', 'N/A')}")
+            f"<b>Email:</b> {account.get('game_email', 'N/A')}<br>"
+            f"<b>Server:</b> {server_line}<br>"
+            f"<b>Trạng thái:</b> <span style='color:{color};'>{status}</span><br><br>"
+            f"<b>Xây dựng cuối:</b> {fmt_d(account.get('last_build_date'))}<br>"
+            f"<b>Viễn chinh cuối:</b> {fmt_dt(account.get('last_expedition_time'))}<br>"
+            f"<b>Rời LM cuối:</b> {fmt_dt(account.get('last_leave_time'))}<br>"
+            f"<b>Chúc phúc:</b> {account.get('last_bless_info', 'N/A')}"
+        )
         QMessageBox.information(self, "Thông tin tài khoản", info)
 
-    def on_edit_account(self, row):
-        account = self.online_accounts[row];
-        dialog = AccountDialog(account_data=account, parent=self)
-        if dialog.exec() == QDialog.Accepted:
-            updated_data = dialog.get_data();
-            new_password = updated_data.get("game_password")
-            if new_password:
-                self.log_msg(f"Đang xác thực mật khẩu mới cho {account['game_email']}...");
-                QApplication.setOverrideCursor(Qt.WaitCursor)
-                success, message = check_game_login_client_side(account['game_email'], new_password);
-                QApplication.restoreOverrideCursor()
-                if not success: self.log_msg(f"Xác thực mật khẩu mới thất bại: {message}"); QMessageBox.critical(self,
-                                                                                                                 "Mật khẩu không chính xác",
-                                                                                                                 message); return
-                user_login_email = self.cloud.load_token().email
-                if not user_login_email: QMessageBox.critical(self, "Lỗi",
-                                                              "Không tìm thấy email người dùng để tạo khóa mã hóa."); return
-                encrypted_password = encrypt(new_password, user_login_email)
-                updated_data['game_password'] = encrypted_password
-            self.log_msg(f"Đang cập nhật tài khoản {account['game_email']}...")
-            try:
-                self.cloud.update_game_account(account['id'], updated_data)
-                self.log_msg("Cập nhật thành công! Đang làm mới và đồng bộ...");
-                self.load_and_sync_accounts()
-            except Exception as e:
-                self.log_msg(f"Lỗi khi cập nhật: {e}");
-                QMessageBox.critical(self, "Lỗi API",
-                                     f"Không thể cập nhật tài khoản:\n{e}")
+    def on_edit_account(self, row: int):
+        acc = self.online_accounts[row]
+        current_email = (acc.get('game_email') or '').strip()
+        initial_sid = acc.get('server_id')
+        initial_sname = (acc.get('server_name') or acc.get('server') or '').strip()
 
+        dlg = VerifyGameLoginWebOnlyDialog(
+            self.cloud,
+            parent=self,
+            edit_mode=True,  # bật chế độ sửa
+            preset_email=current_email,  # email phải khớp khi đăng nhập
+            initial_server_id=initial_sid,  # chọn sẵn server hiện tại
+            initial_server_name=initial_sname,
+            lock_email=True  # (tùy) chặn sửa email trên trang login
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        data = dlg.get_verified_payload() or {}
+
+        payload = {}
+
+        # Server (ưu tiên id, fallback theo tên để tương thích DB cũ varchar(50))
+        sid = data.get('server_id')
+        sname = (data.get('server_name') or '').strip()
+
+        if sid is not None:
+            if initial_sid is None or int(sid) != int(initial_sid):
+                payload['server_id'] = int(sid)
+        else:
+            if sname and sname != initial_sname:
+                payload['server'] = sname
+
+        # Mật khẩu (chỉ khi người dùng đã đăng nhập web thành công)
+        new_plain = data.get('game_password') or ''
+        if new_plain:
+            try:
+                token_data = self.cloud.load_token()
+                owner_email = getattr(token_data, "email", None) if token_data else None
+                if not owner_email:
+                    QMessageBox.critical(self, "Lỗi", "Không tìm thấy email người dùng để tạo khoá mã hoá.")
+                    return
+                payload['game_password'] = encrypt(new_plain, owner_email)
+                payload['game_email'] = current_email
+            except Exception as e:
+                QMessageBox.critical(self, "Lỗi mã hoá", f"Không thể mã hoá mật khẩu mới:\n{e}")
+                return
+
+        if not payload:
+            QMessageBox.information(self, "Thông báo", "Bạn chưa thay đổi gì.")
+            return
+
+        try:
+            self.cloud.update_game_account(int(acc.get('id')), payload)
+            self.log_msg("Cập nhật tài khoản thành công. Đang làm mới danh sách…")
+            self.load_and_sync_accounts()
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi API", f"Không thể cập nhật tài khoản:\n{e}")
     def on_delete_account(self, row):
         account = self.online_accounts[row]
         reply = QMessageBox.question(self, 'Xác nhận xóa',
@@ -623,8 +787,18 @@ class MainWindow(QMainWindow):
                 self.tbl_bless.setItem(r, BLESS_COL_LAST, QTableWidgetItem(last_run_str))
             self.log_msg(f"Đã tải {len(self.blessing_targets)} mục tiêu Chúc phúc.")
         except Exception as e:
-            self.log_msg(f"Lỗi tải DS Chúc phúc: {e}");
-            QMessageBox.critical(self, "Lỗi API", f"Không thể tải dữ liệu Chúc phúc:\n{e}")
+            detail = ""
+            try:
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    try:
+                        detail = f" [HTTP {resp.status_code}] {resp.json()}"
+                    except Exception:
+                        detail = f" [HTTP {resp.status_code}] {resp.text[:200]}"
+            except Exception:
+                pass
+            self.log_msg(f"Lỗi tải DS Chúc phúc: {e}{detail}")
+            QMessageBox.critical(self, "Lỗi API", f"Không thể tải dữ liệu Chúc phúc:\n{e}{detail}")
         finally:
             QApplication.restoreOverrideCursor()
 

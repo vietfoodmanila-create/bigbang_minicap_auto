@@ -83,6 +83,15 @@ class CloudClient:
         except Exception:
             return None
 
+    def get_servers(self) -> list:
+        r = self.session.get(self._url("/api/servers"),
+                             headers=self._auth_headers(), timeout=20)
+        self._raise_for_json_error(r)
+        data = r.json()
+        if isinstance(data, dict):
+            return data.get("data") or data.get("servers") or []
+        return data if isinstance(data, list) else []
+
     def clear_token(self):
         # Xóa token trong bộ nhớ
         self._token = None
@@ -213,21 +222,18 @@ class CloudClient:
         return r.json().get("accounts", [])
 
     def add_game_account(self, data: dict) -> dict:
-        """Thêm một tài khoản game mới."""
-        # Payload giờ được lấy trực tiếp từ dictionary data
         payload = {
             "game_email": data.get("game_email"),
             "game_password": data.get("game_password"),
-            "server": data.get("server")
+            "server_id": data.get("server_id"),
         }
-        r = self.session.post(self._url("/api/game_accounts"), json=payload, headers=self._auth_headers(), timeout=30)
+        r = self.session.post(self._url("/api/game_accounts"), json=payload,
+                              headers=self._auth_headers(), timeout=30)
         self._raise_for_json_error(r)
         return r.json()
 
     def update_game_account(self, account_id: int, data: dict) -> dict:
-        """Cập nhật thông tin một tài khoản game."""
         url = self._url(f"/api/game_accounts/{account_id}")
-        # Tăng timeout vì có thể có cURL check
         r = self.session.put(url, json=data, headers=self._auth_headers(), timeout=30)
         self._raise_for_json_error(r)
         return r.json()
@@ -240,10 +246,18 @@ class CloudClient:
         return r.json()
 #hàm lấy api chúc phúc
     def get_blessing_config(self) -> dict:
-        """Lấy cấu hình Chúc phúc của người dùng."""
-        r = self.session.get(self._url("/api/blessing/config"), headers=self._auth_headers(), timeout=REQUEST_TIMEOUT)
+        r = self.session.get(self._url("/api/blessing/config"),
+                             headers=self._auth_headers(), timeout=REQUEST_TIMEOUT)
         self._raise_for_json_error(r)
-        return r.json().get("config", {})
+        data = r.json()
+        # Chấp nhận cả dạng {"config": {...}} lẫn trả thẳng {"cooldown_hours":..., "per_run":...}
+        if isinstance(data, dict):
+            if "config" in data and isinstance(data["config"], dict):
+                return data["config"]
+            if "cooldown_hours" in data or "per_run" in data:
+                return {"cooldown_hours": data.get("cooldown_hours", 8),
+                        "per_run": data.get("per_run", 3)}
+        return {}
 
     def update_blessing_config(self, data: dict) -> dict:
         """Cập nhật cấu hình Chúc phúc."""
@@ -256,15 +270,14 @@ class CloudClient:
     def get_blessing_targets(self, fetch_all: bool = False) -> list:
         """
         Lấy danh sách các mục tiêu Chúc phúc.
-        :param fetch_all: Nếu True, lấy tất cả mục tiêu để quản lý.
-                          Nếu False, chỉ lấy những mục tiêu đủ điều kiện để chạy auto.
+        :param fetch_all: True => lấy toàn bộ để quản lý; False => chỉ các mục tiêu đến hạn.
         """
         path = "/api/blessing/targets"
         params = {'all': 'true'} if fetch_all else {}
-
         r = self.session.get(self._url(path), headers=self._auth_headers(), params=params, timeout=REQUEST_TIMEOUT)
         self._raise_for_json_error(r)
-        return r.json().get("targets", [])
+        data = r.json()
+        return data if isinstance(data, list) else data.get("targets", [])
 
     def add_blessing_target(self, target_name: str) -> dict:
         """Thêm một mục tiêu Chúc phúc mới."""
@@ -282,12 +295,21 @@ class CloudClient:
         return r.json()
 
     def record_blessing(self, target_id: int, game_account_id: int) -> dict:
-        """Ghi lại một hành động Chúc phúc vào lịch sử."""
         payload = {"target_id": target_id, "game_account_id": game_account_id}
-        r = self.session.post(self._url("/api/blessing/history"), json=payload, headers=self._auth_headers(),
+        r = self.session.post(self._url("/api/blessing/history"),
+                              json=payload,
+                              headers=self._auth_headers(),
                               timeout=REQUEST_TIMEOUT)
-        self._raise_for_json_error(r)
+        if r.status_code >= 400:
+            try:
+                data = r.json()
+                msg = data.get("error") or data.get("message") or r.text
+            except Exception:
+                msg = r.text
+            # ném HTTPError có chứa status + nội dung JSON để chỗ gọi .except log được rõ ràng
+            raise requests.HTTPError(f"{r.status_code} {msg}", response=r)
         return r.json()
+
     # --- utils ---
     @staticmethod
     def _raise_for_json_error(r: requests.Response):

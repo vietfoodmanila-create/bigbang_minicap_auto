@@ -28,7 +28,7 @@ from module import (
 REG_INSIDE = (28, 3, 201, 75)  # lien-minh-inside
 REG_OUTSIDE = (581, 1485, 758, 1600)  # lien-minh-outside
 
-REG_FIND = (33, 516, 628, 615)  # lien-minh-vien-chinh
+REG_FIND = (0, 506, 900, 625)  # lien-minh-vien-chinh
 REG_TRINH_SAT = (715, 1288, 888, 1480)  # nut-trinh-sat
 
 REG_DEN = (308, 1290, 586, 1386)  # nut-den
@@ -141,7 +141,7 @@ def _open_expedition(wk) -> bool:
             return False
 
         # 1) hướng TRÁI→PHẢI (nội dung trượt sang trái): 3 lần, mỗi lần check trước & sau
-        for i in range(3):
+        for i in range(4):
             if _aborted(wk): return False
 
             # check trước swipe
@@ -155,7 +155,7 @@ def _open_expedition(wk) -> bool:
                 break  # quay vòng ngoài để làm lại
 
             # swipe 1 cái
-            _swipe(wk, 280, 980, 880, 980, dur_ms=450)  # trong màn → gần mép phải
+            _swipe(wk, 280, 980, 580, 980, dur_ms=450)  # trong màn → gần mép phải
             if not _sleep_coop(wk, 0.3): return False
 
             # check ngay sau swipe
@@ -172,7 +172,7 @@ def _open_expedition(wk) -> bool:
                 _mem_relief()
 
         # 2) hướng PHẢI→TRÁI (nội dung trượt sang phải): 3 lần, mỗi lần check trước & sau
-        for i in range(3):
+        for i in range(4):
             if _aborted(wk): return False
 
             # check trước swipe
@@ -186,7 +186,7 @@ def _open_expedition(wk) -> bool:
                 break
 
             # swipe 1 cái
-            _swipe(wk, 880, 980, 280, 980, dur_ms=450)  # gần mép phải → trong màn
+            _swipe(wk, 880, 980, 480, 980, dur_ms=450)  # gần mép phải → trong màn
             if not _sleep_coop(wk, 0.3): return False
 
             # check ngay sau swipe
