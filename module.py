@@ -17,7 +17,8 @@ import base64
 import cv2
 import numpy as np
 import pytesseract
-
+from pytesseract import Output
+import unicodedata
 
 # ================== CẤU HÌNH ==================
 ADB = r"D:\Program Files\Nox\bin\nox_adb.exe"
@@ -262,6 +263,129 @@ def ocr_region(img_bgr: np.ndarray, x1, y1, x2, y2, **kwargs) -> str:
     roi = crop(img_bgr, x1, y1, x2, y2)
     return ocr_image(roi, **kwargs)
 
+# ===== OCR: tìm vị trí dòng text tự do =====
+def _normalize_text(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^0-9a-zA-Z]+", " ", s).strip().lower()
+    return s
+
+def _choose_lang(lang_preference: str = "vie+eng") -> str:
+    langs_raw = (_list_langs() or "").lower()
+    def has(x): return x in langs_raw
+    if "+" in (lang_preference or ""):
+        parts = [p.strip().lower() for p in lang_preference.split("+") if p.strip()]
+        if parts and all(has(p) for p in parts):
+            return "+".join(parts)
+    if has("vie") and has("eng"): return "vie+eng"
+    if has("vie"): return "vie"
+    if has("eng"): return "eng"
+    return "eng"
+
+def ocr_find_text_boxes(img_bgr, query: str, psm: int = 6,
+                        lang_preference: str = "vie+eng",
+                        min_conf: int = 45):
+    """
+    Trả danh sách match: [{text, conf_avg, bbox:(x1,y1,x2,y2), center:(cx,cy)}].
+    - Quét toàn ảnh (hoặc ROI bạn truyền vào) để tìm 'query' theo chuẩn hoá không dấu.
+    - Dùng sliding-window trên từng dòng để gom bbox đúng đoạn khớp.
+    """
+    if not query: return []
+    qnorm = _normalize_text(query)
+
+    # Tiền xử lý giống ocr_image hiện có
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
+
+    lang = _choose_lang(lang_preference)
+    cfg = f"--psm {psm} --oem 3"
+
+    data = pytesseract.image_to_data(gray, lang=lang, config=cfg, output_type=Output.DICT)
+
+    # Gom theo (block, par, line)
+    n = len(data.get("text", []))
+    groups = {}
+    for i in range(n):
+        try:
+            conf = int(float(data["conf"][i]))
+        except Exception:
+            conf = -1
+        txt = (data["text"][i] or "").strip()
+        if not txt or conf < min_conf:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        groups.setdefault(key, []).append(i)
+
+    matches = []
+    for key, idxs in groups.items():
+        # theo thứ tự trái -> phải
+        idxs.sort(key=lambda i: data["left"][i])
+        tokens = []
+        for i in idxs:
+            t = _normalize_text(data["text"][i])
+            if t:
+                tokens.append({
+                    "i": i,
+                    "t": t,
+                    "l": data["left"][i],
+                    "t0": data["top"][i],
+                    "r": data["left"][i] + data["width"][i],
+                    "b": data["top"][i] + data["height"][i],
+                    "c": float(data["conf"][i]) if data["conf"][i] not in ("", None) else 0.0
+                })
+        if not tokens:
+            continue
+
+        # Sliding window để tìm đoạn khớp qnorm
+        norm_list = [tok["t"] for tok in tokens]
+        # Tạo các chuỗi có khoảng trắng chuẩn hoá
+        for s in range(len(tokens)):
+            acc = ""
+            confs = []
+            x1 = y1 = 10**9
+            x2 = y2 = -10**9
+            for e in range(s, len(tokens)):
+                if acc:
+                    acc += " " + norm_list[e]
+                else:
+                    acc = norm_list[e]
+                confs.append(tokens[e]["c"])
+                x1 = min(x1, tokens[e]["l"]); y1 = min(y1, tokens[e]["t0"])
+                x2 = max(x2, tokens[e]["r"]); y2 = max(y2, tokens[e]["b"])
+
+                if acc == qnorm or qnorm in acc:
+                    cx = (x1 + x2) // 2; cy = (y1 + y2) // 2
+                    matches.append({
+                        "text": " ".join(data["text"][tokens[k]["i"]] for k in range(s, e+1)),
+                        "conf_avg": sum(confs)/len(confs),
+                        "bbox": (x1, y1, x2, y2),
+                        "center": (cx, cy)
+                    })
+                    break  # khớp đầu tiên trong line là đủ
+    return matches
+
+def find_text_on_screen(wk, query: str, region=None, **kwargs):
+    """
+    region: (x1,y1,x2,y2) nếu chỉ muốn quét 1 vùng.
+    Trả (ok, center, bbox, info)
+    """
+    img = grab_screen_np(wk)
+    if img is None:
+        return False, None, None, None
+    xoff = yoff = 0
+    if region:
+        x1,y1,x2,y2 = region
+        xoff, yoff = x1, y1
+        img = img[y1:y2, x1:x2].copy()
+    ms = ocr_find_text_boxes(img, query, **kwargs)
+    if not ms:
+        return False, None, None, None
+    # lấy match có conf_avg cao nhất
+    m = max(ms, key=lambda z: z["conf_avg"])
+    (x1,y1,x2,y2) = m["bbox"]
+    cx, cy = m["center"]
+    return True, (cx+xoff, cy+yoff), (x1+xoff, y1+yoff, x2+xoff, y2+yoff), m
 
 # ================== PYAUTOGUI-LIKE ==================
 def locate_and_tap_loop(template_path: str, tries: int = 5, thr=DEFAULT_THR, interval=0.8) -> bool:

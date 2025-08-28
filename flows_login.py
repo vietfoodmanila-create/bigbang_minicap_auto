@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import cv2
 import numpy as np
-
+from module import log_wk as log
 # ====== import toàn bộ helper dùng chung từ module.py ======
 from module import (
     log_wk as _log,
@@ -20,9 +20,11 @@ from module import (
     type_text as _type_text,
     back as _back,
     state_simple as _state_simple,
-    free_img,resource_path
+    free_img,resource_path,
+    ocr_region as _ocr_region
 )
-
+import unicodedata, re
+from pathlib import Path
 # ================== VÙNG ==================
 REG_CLEAR_EMAIL_X = (645, 556, 751, 731)
 REG_EMAIL_EMPTY = (146, 586, 756, 720)
@@ -35,7 +37,9 @@ REG_GAME_LOGIN_BUTTON = (318, 1183, 590, 1308)
 REG_XAC_NHAN_OFFLINE = (511, 1253, 790, 1363)
 REG_ICON_LIEN_MINH = (598, 1463, 753, 1600)
 REG_THONG_BAO = (315, 228, 620, 375)
-
+REG_CUR_SERVER  = (345,1083,506,1145)   # vùng hiển thị server hiện tại
+REG_SERVER_ICON = (43,380,335,478)      # vùng chứa icon server.png
+REG_SERVER_LIST = (318, 331, 856, 1178)    # vùng danh sách server
 # ================== ẢNH ==================
 IMG_CLEAR_EMAIL_X = resource_path("images/login/clear_email_x.png")
 IMG_EMAIL_EMPTY = resource_path("images/login/email_empty.png")
@@ -48,13 +52,14 @@ IMG_GAME_LOGIN_BUTTON = resource_path("images/login/game_login_button.png")
 IMG_XAC_NHAN_OFFLINE = resource_path("images/login/xac_nhan_offline.png")
 IMG_ICON_LIEN_MINH = resource_path("images/login/icon_lien_minh.png")
 IMG_THONG_BAO = resource_path("images/login/thong-bao.png")
-
+IMG_SERVER_ICON = resource_path("images/server_list/server.png")
 # ================== GAME PKG/ACT (đồng bộ test) ==================
 GAME_PKG = "com.phsgdbz.vn"
 GAME_ACT = "com.phsgdbz.vn/org.cocos2dx.javascript.GameTwActivity"
 
 GRAY_SATURATION_MAX = 25
-
+THR_SERVER_IMG  = 0.85
+THR_SERVER_FIND = 0.85
 
 def _is_pixel_gray(img: np.ndarray, x: int, y: int) -> tuple[bool, str]:
     if img is None:
@@ -70,12 +75,163 @@ def _is_pixel_gray(img: np.ndarray, x: int, y: int) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Lỗi khi kiểm tra màu pixel: {e}"
 
+def _norm_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = s.replace("đ", "d").replace("Đ", "D").lower()
+    return re.sub(r"[^a-z0-9]+", "", s)
 
 def select_server(wk, server: str) -> bool:
-    if not server: return True
-    _log(wk, f"(TODO) Chọn server: {server}")
-    return True
+    """
+    server: img_url từ API, ví dụ "images/server_list/dosat-s8.png".
+    Quy trình:
+      1) HEADER (REG_CUR_SERVER): OCR → normalize (bỏ dấu, non-alnum, '0'->'o') → so với expected → ĐÚNG: return True.
+      2) Sai → tap_center(REG_CUR_SERVER) → sleep 0.5s →
+               tìm & nhấn server.png (REG_SERVER_ICON) → sleep 1.0s →
+               OCR quét LIST (REG_SERVER_LIST) theo "ô" dọc (có overlap) → ô match expected thì tap → return True.
+      3) Không tìm được thì return False.
+    Yêu cầu: các hằng số REG_CUR_SERVER, REG_SERVER_ICON, REG_SERVER_LIST,
+             IMG_SERVER_ICON (images/server_list/server.png), THR_SERVER_FIND đã khai báo bên ngoài.
+             Đầu file đã import: cv2, numpy as np, _ocr_region, find_on_frame, _tap/_tap_center, _sleep_coop, _grab_screen_np, free_img, _log, resource_path.
+    """
 
+    # ---- helpers ----
+    def _norm_base(s: str) -> str:
+        if not s:
+            return ""
+        s = unicodedata.normalize("NFD", s)
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+        s = s.replace("đ", "d").replace("Đ", "D").lower()
+        s = re.sub(r"[^a-z0-9]+", "", s)
+        return s
+
+    def _norm0(s: str) -> str:
+        # Chuẩn hoá + đổi '0' thành 'o' để tránh nhầm lẫn OCR (0/o)
+        return _norm_base(s).replace("0", "o")
+
+    if not server:
+        _log(wk, "[LOGIN][SV] server(img_url) rỗng → bỏ qua chọn server.")
+        return True
+
+    expected_raw  = Path(server).stem                # "dosat-s8"
+    expected_norm = _norm0(expected_raw)             # "dosats8" (và '0'->'o' nếu có)
+    _log(wk, f"[LOGIN][SV] EXPECTED='{expected_raw}' → norm0='{expected_norm}' | server='{server}'")
+
+    # ---------------- 1) HEADER: OCR vùng REG_CUR_SERVER (có preprocessing ổn định) ----------------
+    img0 = _grab_screen_np(wk)
+    try:
+        x1, y1, x2, y2 = REG_CUR_SERVER
+        roi = img0[y1:y2, x1:x2].copy()
+        h, w = roi.shape[:2]
+        scale = 3 if max(h, w) < 60 else 2
+        roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, d=7, sigmaColor=60, sigmaSpace=60)
+        th   = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        mean_val = float(np.mean(th))
+        if mean_val < 127.0:  # nền trắng, chữ đen
+            th = cv2.bitwise_not(th)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+        th = cv2.copyMakeBorder(th, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255)
+        prep = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
+
+        txt7 = (_ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=7) or "").strip()
+        txt6 = "" if txt7 else (_ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=6) or "").strip()
+        cur_txt  = (txt7 or txt6).replace("\n", " ")
+        cur_norm = _norm0(cur_txt)
+        ok_hdr   = bool(cur_norm) and (cur_norm == expected_norm or expected_norm in cur_norm or cur_norm in expected_norm)
+        _log(wk, f"[LOGIN][SV] HEADER-OCR-PP ROI={w}x{h} scale={scale} mean={mean_val:.1f} "
+                 f"psm7='{txt7}' psm6='{txt6}' → use='{cur_txt}' norm0='{cur_norm}' "
+                 f"expected='{expected_norm}' match={ok_hdr}")
+        if ok_hdr:
+            _log(wk, "[LOGIN][SV] ✅ HEADER khớp (OCR) → đúng server sẵn, bỏ qua chọn.")
+            return True
+    finally:
+        free_img(img0)
+
+
+    # ---------------- 2) MỞ DANH SÁCH: tap vùng hiện tại → 0.5s → tìm & nhấn server.png ----------------
+    _log(wk, "[LOGIN][SV] OPEN-LIST: tap_center(REG_CUR_SERVER) → chờ 1.5s.")
+    _tap_center(wk, REG_CUR_SERVER)
+    if not _sleep_coop(wk, 1.5):
+        return False
+
+    img2 = _grab_screen_np(wk)
+    try:
+        ok_icon, pos_icon, sc_icon = find_on_frame(img2, IMG_SERVER_ICON, region=REG_SERVER_ICON, threshold=THR_SERVER_FIND)
+        _log(wk, f"[LOGIN][SV] FIND ICON server.png: region={REG_SERVER_ICON} thr={THR_SERVER_FIND} "
+                 f"→ ok={ok_icon} pos={pos_icon} score={sc_icon}")
+    finally:
+        free_img(img2)
+
+    if not ok_icon or not pos_icon:
+        _log(wk, "[LOGIN][SV] ❌ Không thấy icon server.png để mở danh sách.")
+        return False
+
+    _log(wk, f"[LOGIN][SV] TAP ICON server.png tại {pos_icon} → chờ 1.0s.")
+    _tap(wk, *pos_icon)
+    if not _sleep_coop(wk, 1.0):
+        return False
+
+    # ---------------- 3) DANH SÁCH: OCR quét theo các “ô” dọc trong REG_SERVER_LIST (có overlap) ----------------
+    N_SLOTS = 12
+    x1, y1, x2, y2 = REG_SERVER_LIST
+    H = max(1, y2 - y1)
+    row_h  = max(32, H // N_SLOTS)
+    stride = max(20, int(row_h * 0.75))  # chồng lấn 25% để tránh cắt hụt
+
+    img3 = _grab_screen_np(wk)
+    try:
+        _log(wk, f"[LOGIN][SV] SCAN-LIST reg={REG_SERVER_LIST} → row_h≈{row_h}, stride={stride}")
+        i = 0
+        ry1 = y1
+        while ry1 + 10 < y2:
+            ry2 = min(y2, ry1 + row_h)
+
+            # OCR ô (preprocessing giống HEADER)
+            roi = img3[ry1:ry2, x1:x2].copy()
+            h, w = roi.shape[:2]
+            scale = 3 if max(h, w) < 60 else 2
+            roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.bilateralFilter(gray, d=7, sigmaColor=60, sigmaSpace=60)
+            th   = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            mean_val = float(np.mean(th))
+            if mean_val < 127.0:
+                th = cv2.bitwise_not(th)
+            th = cv2.morphologyEx(th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+            th = cv2.copyMakeBorder(th, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255)
+            prep = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
+
+            t7 = (_ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=7) or "").strip()
+            t6 = "" if t7 else (_ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=6) or "").strip()
+            use_txt  = (t7 or t6).replace("\n", " ")
+            use_norm = _norm0(use_txt)
+
+            i += 1
+            hit = bool(use_norm) and (use_norm == expected_norm or expected_norm in use_norm or use_norm in expected_norm)
+            _log(wk, f"[LOGIN][SV] SLOT#{i:02d} reg=({x1},{ry1},{x2},{ry2}) ROI={w}x{h} scale={scale} mean={mean_val:.1f} "
+                     f"psm7='{t7}' psm6='{t6}' → use='{use_txt}' norm0='{use_norm}' "
+                     f"expected='{expected_norm}' match={hit}")
+
+            if hit:
+                cx = (x1 + x2) // 2
+                cy = (ry1 + ry2) // 2
+                _log(wk, f"[LOGIN][SV] ✅ MATCH tại SLOT#{i:02d} → TAP ({cx},{cy})")
+                _tap(wk, cx, cy)
+                if not _sleep_coop(wk, 0.3):
+                    return False
+                return True
+
+            ry1 += stride
+    finally:
+        free_img(img3)
+
+    _log(wk, "[LOGIN][SV] ❌ Không tìm thấy server theo OCR trong danh sách.")
+    return False
 
 def _pre_login_taps(wk):
     seq = [(690, 650, 0.15), (693, 758, 0.15), (690, 650, 0.15)]
@@ -120,11 +276,7 @@ def login_once(wk, email: str, password: str, server: str = "", date: str = "") 
     _type_text(wk, password)
     if not _sleep_coop(wk, 0.2): return False
 
-    # 3) (tuỳ chọn) chọn server
-    if not select_server(wk, server):
-        _log(wk, "Chọn server thất bại.");
-        return False
-    if _aborted(wk): return False
+
 
     # 4) Nhấn Login
     img = _grab_screen_np(wk)
@@ -162,6 +314,11 @@ def login_once(wk, email: str, password: str, server: str = "", date: str = "") 
                 _log(wk, "⚠️ Phát hiện trò chơi đang bảo trì.")
                 free_img(img);
                 return False
+            # 3) (tuỳ chọn) chọn server
+            if not select_server(wk, server):
+                _log(wk, "Chọn server thất bại.");
+                return False
+            if _aborted(wk): return False
             if pt_game:
                 _tap(wk, *pt_game);
                 pressed_once = True

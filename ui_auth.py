@@ -92,6 +92,29 @@ class CloudClient:
             return data.get("data") or data.get("servers") or []
         return data if isinstance(data, list) else []
 
+    # ---- Compatibility alias: GET ----
+    def get(self, path: str, params: dict | None = None):
+        """
+        Trả về JSON dict từ API GET path (hỗ trợ ?query).
+        Cho phép gọi cloud.get("/api/servers", params={"id": 1})
+        """
+        # Ưu tiên dùng hàm request() sẵn có, nếu class đã có:
+        if hasattr(self, "request"):
+            return self.request("GET", path, params=params)
+
+        # Fallback thẳng HTTP (nếu class chưa có request()):
+        import requests
+        from urllib.parse import urljoin
+        base = getattr(self, "base_url", None) or getattr(self, "api_base", None) or ""
+        url = urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+        headers = {}
+        tok = getattr(self, "token", None) or getattr(self, "access_token", None)
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        resp = requests.get(url, params=params or {}, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
     def clear_token(self):
         # Xóa token trong bộ nhớ
         self._token = None

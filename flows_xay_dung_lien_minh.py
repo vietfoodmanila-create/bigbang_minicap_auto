@@ -108,7 +108,7 @@ def _watch_ads_loop(wk):
         if not ok_qc:
             break
         if pt_qc: _tap(wk, *pt_qc)
-        if not _sleep_coop(wk, 0.4): return
+        if not _sleep_coop(wk, 1.0): return
 
         img2 = _grab_screen_np(wk)
         ok_vid, pt_vid, _ = _find_on_frame(img2, IMG_XEM_VIDEO, region=REG_XEM_VIDEO, threshold=THR_DEFAULT)

@@ -412,7 +412,10 @@ class AccountRunner(QObject, threading.Thread):
                 account_id = rec.get('id')
                 email = rec.get('game_email', '')
                 encrypted_password = rec.get('game_password', '')
-                server = str(rec.get('server', ''))
+                server_id = int(rec.get('server_id', '0'))
+                resp = self.cloud.get(f"/api/servers?id={server_id}")
+                img_url = (resp.get("data") or {}).get("img_url", "")
+                server = img_url  # truyền thẳng img_url cho flow
 
                 try:
                     password = decrypt(encrypted_password, self.user_login_email)

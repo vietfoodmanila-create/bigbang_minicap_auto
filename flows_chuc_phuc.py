@@ -308,7 +308,7 @@ def run_bless_flow(wk, targets: List[str], log=None, max_scrolls: int = SCROLL_L
 
         # Vuốt chậm & nghỉ 1.5s cho ổn định
         L(wk, f"Kéo trang chậm (dur_ms={SWIPE_DUR_MS}) — 446,1256 → 446,190")
-        swipe(wk, 446, 1256, 446, 188, dur_ms=SWIPE_DUR_MS)
+        swipe(wk, 446, 1255, 446, 188, dur_ms=SWIPE_DUR_MS)
         if not sleep_coop(wk, 1.5):
             break
 
