@@ -92,6 +92,35 @@ class CloudClient:
             return data.get("data") or data.get("servers") or []
         return data if isinstance(data, list) else []
 
+    # ui_auth.py – trong class CloudClient
+
+    def get_user_config(self, key: str) -> str:
+        r = self.session.get(
+            self._url("/api/user_config"),
+            headers=self._auth_headers(),
+            params={"key": key},
+            timeout=REQUEST_TIMEOUT
+        )
+        # 404 = chưa có config -> trả chuỗi rỗng, đừng raise
+        if r.status_code == 404:
+            return ""
+        self._raise_for_json_error(r)
+
+        payload = r.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return str(data.get("value") or "") if isinstance(data, dict) else ""
+
+    def set_user_config(self, key: str, value: str | None) -> dict:
+        payload = {"key": key, "value": value}
+        r = self.session.post(
+            self._url("/api/user_config"),
+            headers=self._auth_headers(),
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
+        self._raise_for_json_error(r)
+        return r.json().get("data", {})  # {id, user_id, key, value}
+
     # ---- Compatibility alias: GET ----
     def get(self, path: str, params: dict | None = None):
         """

@@ -27,8 +27,8 @@ from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 import requests
 from module import resource_path
-from PySide6.QtCore import Qt, QPoint, QSize
-from PySide6.QtGui import QCloseEvent, QTextCursor, QIcon, QPixmap
+from PySide6.QtCore import Qt, QPoint, QSize,QRegularExpression
+from PySide6.QtGui import QCloseEvent, QTextCursor, QIcon, QPixmap,QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
@@ -308,6 +308,30 @@ class MainWindow(QMainWindow):
         feat_layout = QVBoxLayout(w_feat);
         grp = QGroupBox("Tính năng liên minh");
         form = QFormLayout(grp)
+        # --- Gia nhập liên minh: TextBox + nút Sửa/Lưu ---
+        row_gt = QWidget()
+        row_gt_lay = QHBoxLayout(row_gt)
+        row_gt_lay.setContentsMargins(0, 0, 0, 0)
+
+        self.ed_guild_target = QLineEdit()
+        self.ed_guild_target.setEnabled(False)  # mặc định khóa
+        self.ed_guild_target.setMaxLength(12)  # tối đa 12 ký tự
+        # Validator: không cho khoảng trắng
+        self.ed_guild_target.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"\S{0,12}"), self.ed_guild_target)
+        )
+        # Tự làm sạch nếu người dùng paste có khoảng trắng / dài quá 12
+        self.ed_guild_target.textChanged.connect(self._on_guild_text_changed)
+
+        self.btn_guild_edit_save = QPushButton("Sửa")
+        self.btn_guild_edit_save.setFixedWidth(56)
+        self.btn_guild_edit_save.clicked.connect(self.on_guild_edit_save_clicked)
+
+        row_gt_lay.addWidget(self.ed_guild_target, 1)
+        row_gt_lay.addWidget(self.btn_guild_edit_save)
+
+        form.addRow(QLabel("Gia nhập liên minh:"), row_gt)
+        self.load_user_guild_target()
         self.chk_build = QCheckBox("Xây dựng liên minh / xem quảng cáo");
         self.chk_expedition = QCheckBox("Viễn chinh")
         self.chk_auto_leave = QCheckBox("Tự thoát liên minh sau khi thao tác xong");
@@ -477,6 +501,62 @@ class MainWindow(QMainWindow):
 
     def load_accounts_current_port(self):
         self.load_and_sync_accounts()
+    def _on_guild_text_changed(self, s: str):
+        """
+        Làm sạch khi người dùng paste: loại bỏ mọi khoảng trắng và cắt 12 ký tự.
+        (Validator đã chặn nhập mới, nhưng vẫn xử lý trường hợp paste.)
+        """
+        s2 = "".join(ch for ch in (s or "") if not ch.isspace())
+        if s2 != s or len(s2) > 12:
+            self.ed_guild_target.blockSignals(True)
+            self.ed_guild_target.setText(s2[:12])
+            self.ed_guild_target.blockSignals(False)
+
+    def load_user_guild_target(self):
+        try:
+            val = self.cloud.get_user_config("guild_target")  # <- giờ là string
+            self.ed_guild_target.blockSignals(True)
+            self.ed_guild_target.setText(val)
+            self.ed_guild_target.blockSignals(False)
+            self.log_msg(f"[DBG] guild_target loaded = {repr(val)}")
+        except Exception as e:
+            self.ed_guild_target.blockSignals(True)
+            self.ed_guild_target.setText("")
+            self.ed_guild_target.blockSignals(False)
+            self.log_msg(f"Lỗi tải guild_target: {e}")
+
+        self.ed_guild_target.setEnabled(False)
+        self.btn_guild_edit_save.setText("Sửa")
+
+    def on_guild_edit_save_clicked(self):
+        """
+        Nhấn 'Sửa' -> bật nhập, đổi nút thành 'Lưu'.
+        Nhấn 'Lưu' -> gọi API set_user_config, khóa nhập, đổi nút về 'Sửa'.
+        """
+        if self.btn_guild_edit_save.text() == "Sửa":
+            self.ed_guild_target.setEnabled(True)
+            self.ed_guild_target.setFocus()
+            self.btn_guild_edit_save.setText("Lưu")
+            return
+
+        # Trường hợp đang ở 'Lưu'
+        val = (self.ed_guild_target.text() or "").strip()
+        if " " in val:
+            QMessageBox.warning(self, "Cảnh báo",
+                                "Tên liên minh không được chứa khoảng trắng.")
+            return
+        if len(val) > 12:
+            val = val[:12]
+            self.ed_guild_target.setText(val)
+
+        try:
+            resp = self.cloud.set_user_config("guild_target", val)
+            self.log_msg(f"Đã lưu guild_target='{val}'. RESP={resp}")
+            self.ed_guild_target.setEnabled(False)
+            self.btn_guild_edit_save.setText("Sửa")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi API",
+                                 f"Không thể lưu guild_target:\n{e}")
 
     def populate_accounts_table(self, checked_emails: set = None):
         # Sử dụng một set rỗng làm giá trị mặc định an toàn
