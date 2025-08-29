@@ -490,6 +490,7 @@ class AccountRunner(QObject, threading.Thread):
                     if (features.get("build") or features.get("expedition")) and _leave_cooldown_passed(
                             rec.get('last_leave_time')
                     ):
+                        self.wk.ga_id = int(account_id)
                         join_guild_once(self.wk, log=self.log)
 
                     if features.get("build") and rec.get('last_build_date') != _today_str_for_build():

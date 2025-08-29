@@ -167,103 +167,254 @@ def _open_guild_ui(wk) -> str:
         _log(wk, "↩️ 5 lần chưa thấy 'Gia nhập'/'Inside' → quay lại bấm Outside.")
 
 # ------------------ Public: gia nhập liên minh ------------------
-def join_guild_once(wk, log=print) -> bool:
+def join_guild_once(wk, log=None) -> bool:
     """
-    Kịch bản:
-    1) _open_guild_ui:
-       - 'inside' -> xong (True)
-       - 'join'   -> sang bước 2
-    2) Ở trạng thái 'join':
-       - Kiểm tra màu REG_JOIN_COLOR/điểm PT_JOIN_COLOR:
-           * 'full' → ESC + ngủ 15s rồi làm lại
-           * 'ok'   → tap JOIN → mở lại UI; nếu thấy 'inside' => True
-           * None   → vẫn tap JOIN để thử, rồi mở lại UI kiểm tra
+    Logic xin vào liên minh (tuân thủ flow cũ, thêm 2 nhánh theo config 'guild_target'):
+
+    - Nếu KHÔNG có user_config 'guild_target' (hoặc value rỗng):
+        + Mỗi vòng: mở UI liên minh (dùng _open_guild_ui cũ) → nếu 'inside' thì DONE.
+        + Nếu ở trạng thái có nút 'gia-nhap-lien-minh' → kiểm tra màu bằng _classify_join_color:
+            * 'full' (xám) → ESC, đợi 15s, mở lại UI, lặp.
+            * 'ok' hoặc None → TAP 'gia-nhap-lien-minh' 1 lần rồi theo dõi; vào 'inside' là DONE.
+    - Nếu CÓ user_config 'guild_target' (value != ""):
+        + Mỗi vòng: mở UI liên minh → nếu 'inside' thì DONE.
+        + Tìm 'kiem-tra-chung.png' ở (663,156,861,243), nếu có:
+            * TAP ô nhập (391,201) → xoá sạch (gửi nhiều DEL) → _type_text(value)
+            * TAP nút 'kiem-tra-chung.png' 2 lần để tìm
+            * Trong 2s, mỗi 0.25s kiểm tra 'chua-thay-lien-minh.png' ở (261,765,651,821):
+                - Nếu THẤY → log cảnh báo đỏ, nghỉ 5 phút, return False (nhường vòng sau)
+            * Nếu KHÔNG thấy 'chua-thay-lien-minh' → tìm 'gia-nhap-lien-minh.png' ở (315,1363,595,1456):
+                - Nếu THẤY → TAP 2 lần; theo dõi chuyển 'inside'. Thử tối đa 2 lần TAP-2-lần.
+                - Nếu KHÔNG THẤY → nếu còn đang ở 'kiem-tra-chung' thì lặp lại tìm & nhập.
+            * Nếu đã TAP 'gia-nhap-lien-minh' 2 lần mà vẫn không vào 'inside':
+                - Cập nhật last_leave_time = NOW qua CloudClient (tham khảo flows_thoat_lien_minh),
+                  rồi return False để chuyển tài khoản khác.
+
+    Ghi chú: dùng lại helpers/module cũ: _open_guild_ui, _classify_join_color, find_on_frame, _tap/_type_text/_sleep_coop/_adb_safe, resource_path...
     """
-    if _aborted(wk):
-        _log(wk, "⛔ Hủy trước khi join guild.")
-        _mem_relief()
-        return False
+    from module import (
+        log_wk as _log, grab_screen_np as _grab_screen_np, free_img,
+        find_on_frame, tap as _tap, sleep_coop as _sleep_coop, adb_safe as _adb_safe,
+        resource_path, type_text as _type_text
+    )
+    import time
+    from datetime import datetime
 
-    state = _open_guild_ui(wk)
-    if state == "abort":
-        _mem_relief()
-        return False
-    if state == "inside":
-        _log(wk, "✅ Đã ở liên minh (inside) → bỏ qua gia nhập.")
-        _mem_relief()
-        return True
+    # ===== IMG & REG theo yêu cầu =====
+    IMG_JOIN_BTN        = resource_path("images/lien_minh/gia-nhap.png")
+    IMG_INSIDE          = resource_path("images/lien_minh/lien-minh-inside.png")
+    IMG_KIEM_TRA_CHUNG  = resource_path("images/lien_minh/kiem-tra-chung.png")
+    IMG_SEARCH_NOTFOUND = resource_path("images/lien_minh/chua-thay-lien-minh.png")
 
-    # đang thấy JOIN
-    while True:
-        if _aborted(wk):
-            _log(wk, "⛔ Hủy trong lúc xin gia nhập.")
-            _mem_relief()
-            return False
+    REG_JOIN_BTN        = (315, 1363, 595, 1456)
+    REG_KIEM_TRA_CHUNG  = (663, 156, 861, 243)
+    REG_SEARCH_NOTFOUND = (261, 765, 651, 821)
+    # REG_INSIDE: tuỳ ảnh 'lien-minh-inside.png' của bạn; dùng vùng an toàn quanh header trong UI inside
+    REG_INSIDE          = (581, 134, 843, 228)
 
+    # Toạ độ ô nhập cho phương án 2
+    PT_SEARCH_INPUT     = (391, 201)
+
+    THR = 0.86
+
+    def _state_now():
         img = _grab_screen_np(wk)
-        ok_join, pt, _ = _find_on_frame(img, IMG_JOIN, region=REG_JOIN_BTN, threshold=THR_DEFAULT)
-        _free_img(img)
-        if not ok_join or not pt:
-            _log(wk, "ℹ️ Không còn nút 'Gia nhập liên minh' → mở lại giao diện để kiểm tra.")
-            state = _open_guild_ui(wk)
-            if state == "abort":
-                _mem_relief()
-                return False
-            if state == "inside":
-                _log(wk, "🎉 Xác nhận đã vào liên minh (inside).")
-                _mem_relief()
-                return True
-            continue  # state == "join" → lặp tiếp
+        try:
+            ok_inside, _, _ = find_on_frame(img, IMG_INSIDE, region=REG_INSIDE, threshold=THR)
+            if ok_inside:
+                return "inside", None
+            ok_join, pt_join, _ = find_on_frame(img, IMG_JOIN_BTN, region=REG_JOIN_BTN, threshold=THR)
+            if ok_join and pt_join:
+                return "join_btn", pt_join
+            ok_kc, pt_kc, _ = find_on_frame(img, IMG_KIEM_TRA_CHUNG, region=REG_KIEM_TRA_CHUNG, threshold=THR)
+            if ok_kc and pt_kc:
+                return "kiemtra", pt_kc
+            return "unknown", None
+        finally:
+            free_img(img)
 
-        # ==== Kiểm tra màu trước khi nhấn JOIN ====
-        if not _sleep_coop(wk, 0.2):
-            _mem_relief()
-            return False  # nhịp nhỏ để UI ổn định
-        join_state = _classify_join_color(wk)  # 'ok' | 'full' | None
-        if join_state == "full":
-            _log(wk, "🚧 Nút xin vào đang XÁM (đã đủ người). ESC đóng giao diện, đợi 15s rồi thử lại…")
-            _adb_safe(wk, "shell", "input", "keyevent", "4", timeout=2)  # ESC
-            if not _sleep_coop(wk, 15.0):
-                _mem_relief()
-                return False
-            # quay lại mở giao diện từ đầu
-            state = _open_guild_ui(wk)
-            if state == "abort":
-                _mem_relief()
-                return False
-            if state == "inside":
-                _log(wk, "🎉 Trong thời gian chờ đã vào liên minh (inside).")
-                _mem_relief()
-                return True
+    def _get_guild_target() -> str:
+        val = ""  # mặc định khi chưa có cấu hình / wk.cloud rỗng
+        try:
+            cloud = getattr(wk, "cloud", None)
+            if cloud:
+                # CloudClient.get_user_config() trả về CHUỖI value; 404 -> "" (không ném lỗi)
+                val = str(cloud.get_user_config("guild_target") or "").strip()
             else:
-                continue
-        elif join_state == "ok":
-            _log(wk, "✅ Nút xin vào đang XANH (còn slot) — tiến hành xin vào.")
-        else:
-            _log(wk, "ℹ️ Không chắc theo màu — vẫn thử xin vào.")
-        # ==== /Kiểm tra màu ====
+                _log(wk, "[GUILD] wk.cloud rỗng — coi như chưa có config.")
+        except Exception as e:
+            _log(wk, f"[GUILD] get_user_config('guild_target') lỗi: {e}")
+        return val
 
-        # Nếu còn slot (hoặc không chắc) → NHẤN JOIN
-        _tap(wk, *pt)
-        if not _sleep_coop(wk, 0.3):
-            _mem_relief()
-            return False
+    # ===== vòng lặp tối đa 5 lần như yêu cầu =====
+    join_double_taps = 0
+    for round_idx in range(1, 6):
+        if not _sleep_coop(wk, 0.2): return False
 
-        # Mở lại để xác nhận trạng thái
+        # Luôn mở UI theo flow cũ (ESC → mở lại). _open_guild_ui là hàm cũ đã có trong file.
         state = _open_guild_ui(wk)
         if state == "abort":
-            _mem_relief()
-            return False
+            _log(wk, "[GUILD] Hủy mở UI liên minh."); return False
         if state == "inside":
-            _log(wk, "✅ Xin vào liên minh thành công (đã inside).")
-            _mem_relief()
-            return True
+            _log(wk, "[GUILD] Đang ở trong liên minh (inside)."); return True
 
-        # Nếu quay lại vẫn là 'join' → có thể đang chờ duyệt: đợi rồi thử lại
-        _log(wk, "🤔 Chưa xác nhận được — đợi 15s rồi thử lại.")
-        if not _sleep_coop(wk, 15.0):
-            _mem_relief()
-            return False
+        # Load config_value MỖI VÒNG (không cache)
+        guild_target = _get_guild_target()
+        has_target = bool(guild_target)
+
+        # Đánh giá trạng thái hiện tại sau khi UI đã mở
+        cur, pt = _state_now()
+        _log(wk, f"[GUILD] Vòng {round_idx}/5 — guild_target={'<rỗng>' if not has_target else guild_target} — state={cur} pt={pt}")
+
+        # ===== PHƯƠNG ÁN 1: KHÔNG có guild_target → đi theo join button + kiểm màu =====
+        if not has_target:
+            if cur == "inside":
+                return True
+            if cur != "join_btn" or not pt:
+                # Không thấy join button → lặp
+                if not _sleep_coop(wk, 0.8): return False
+                continue
+
+            # Kiểm tra màu theo code cũ
+            if not _sleep_coop(wk, 0.2): return False
+            join_state = _classify_join_color(wk)  # 'ok' | 'full' | None (hàm cũ)
+            if join_state == "full":
+                _log(wk, "🚧 Nút xin vào đang XÁM (đủ người). ESC và chờ 15s rồi thử lại…")
+                _adb_safe(wk, "shell", "input", "keyevent", "4", timeout=2)  # ESC
+                if not _sleep_coop(wk, 15.0): return False
+                continue
+            elif join_state == "ok":
+                _log(wk, "✅ Nút xin vào đang XANH — tiến hành xin vào.")
+            else:
+                _log(wk, "ℹ️ Không chắc màu — vẫn thử xin vào.")
+
+            _tap(wk, *pt)
+            if not _sleep_coop(wk, 0.3): return False
+
+            # Theo dõi chuyển vào 'inside' trong 10 * 0.5s
+            follow_deadline = time.time() + 5.0
+            while time.time() < follow_deadline:
+                s2, _ = _state_now()
+                if s2 == "inside":
+                    _log(wk, "🎉 Đã vào liên minh (inside).")
+                    return True
+                if not _sleep_coop(wk, 0.5): return False
+            # chưa vào — lặp vòng ngoài
+            continue
+
+        # ===== PHƯƠNG ÁN 2: CÓ guild_target → dùng 'kiem-tra-chung' để tìm theo tên
+        else:
+            # Bắt buộc có 'kiem-tra-chung' trên header để thao tác
+            if cur != "kiemtra":
+                # thử tìm lại
+                img = _grab_screen_np(wk)
+                try:
+                    ok_kc, pt_kc, _ = find_on_frame(img, IMG_KIEM_TRA_CHUNG, region=REG_KIEM_TRA_CHUNG, threshold=THR)
+                    if ok_kc and pt_kc:
+                        cur, pt = "kiemtra", pt_kc
+                finally:
+                    free_img(img)
+
+            if cur != "kiemtra":
+                _log(wk, "[GUILD] Chưa thấy 'kiem-tra-chung' — lặp.")
+                if not _sleep_coop(wk, 0.8): return False
+                continue
+
+            # Nhập tên liên minh = guild_target
+            _tap(wk, *PT_SEARCH_INPUT)
+            if not _sleep_coop(wk, 0.15): return False
+
+            # Xoá sạch nội dung cũ: di chuyển về cuối rồi DEL nhiều lần
+            _adb_safe(wk, "shell", "input", "keyevent", "123", timeout=2)  # KEYCODE_MOVE_END
+            for _ in range(24):
+                _adb_safe(wk, "shell", "input", "keyevent", "67", timeout=2)  # KEYCODE_DEL nhanh
+            if not _sleep_coop(wk, 0.05): return False
+
+            _type_text(wk, guild_target)
+            if not _sleep_coop(wk, 0.15): return False
+
+            # Bấm 'kiem-tra-chung' 2 lần
+            for _ in range(2):
+                img = _grab_screen_np(wk)
+                try:
+                    ok_kc, pt_kc, _ = find_on_frame(img, IMG_KIEM_TRA_CHUNG, region=REG_KIEM_TRA_CHUNG, threshold=THR)
+                    _log(wk, f"[GUILD] TAP 'kiem-tra-chung' → ok={ok_kc} pt={pt_kc}")
+                finally:
+                    free_img(img)
+                if ok_kc and pt_kc:
+                    _tap(wk, *pt_kc)
+                    if not _sleep_coop(wk, 1.0): return False
+
+            # 2s theo dõi 'chua-thay-lien-minh'
+            not_found = False
+            until = time.time() + 2.0
+            while time.time() < until:
+                img = _grab_screen_np(wk)
+                try:
+                    ok_nf, _, _ = find_on_frame(img, IMG_SEARCH_NOTFOUND, region=REG_SEARCH_NOTFOUND, threshold=THR)
+                finally:
+                    free_img(img)
+                _log(wk, f"[GUILD] Check 'chua-thay-lien-minh' → {ok_nf}")
+                if ok_nf:
+                    not_found = True
+                    break
+                if not _sleep_coop(wk, 0.25): return False
+
+            if not_found:
+                _log(wk, f"[GUILD][❗] KHÔNG TÌM THẤY liên minh '{guild_target}'. Nghỉ 5 phút rồi thử lại. Vui lòng cập nhật tên chính xác.")
+                _sleep_coop(wk, 300.0)  # 5 phút
+                return False
+
+            # Nếu có kết quả — tìm nút 'gia-nhap-lien-minh' trong vùng nút
+            if not _sleep_coop(wk, 2.0): return False
+            img = _grab_screen_np(wk)
+            try:
+                ok_j, pt_j, _ = find_on_frame(img, IMG_JOIN_BTN, region=REG_JOIN_BTN, threshold=THR)
+                _log(wk, f"[GUILD] Tìm 'gia-nhap-lien-minh' → ok={ok_j} pt={pt_j}")
+            finally:
+                free_img(img)
+
+            if ok_j and pt_j:
+                # Bấm 2 lần như yêu cầu rồi theo dõi
+                _tap(wk, *pt_j)
+                if not _sleep_coop(wk, CLICK_DELAY): return False
+                _tap(wk, *pt_j)
+                join_double_taps += 1
+                _log(wk, f"[GUILD] Đã TAP 'gia-nhap-lien-minh' 2 lần (lần {join_double_taps}/2).")
+
+                # Theo dõi chuyển 'inside'
+                until2 = time.time() + 5.0
+                while time.time() < until2:
+                    s2, _ = _state_now()
+                    if s2 == "inside":
+                        _log(wk, "🎉 Đã vào liên minh (inside) sau khi Join theo tên.")
+                        return True
+                    if not _sleep_coop(wk, 0.5): return False
+
+                if join_double_taps >= 2:
+                    # Cập nhật last_leave_time = NOW rồi dừng tài khoản này
+                    cloud = getattr(wk, "cloud", None)
+                    ga_id = getattr(wk, "ga_id", None)
+                    if cloud and ga_id:
+                        try:
+                            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            cloud.update_game_account(int(ga_id), {"last_leave_time": now})
+                            _log(wk, f"[GUILD] 📝 Cập nhật last_leave_time={now} do Join 2 lượt không thành.")
+                        except Exception as e:
+                            _log(wk, f"[GUILD] ⚠️ Lỗi cập nhật last_leave_time: {e}")
+                    return False
+
+                # chưa đủ 2 lần — lặp vòng ngoài để thử lại
+                continue
+
+            else:
+                # Không thấy join button; nếu vẫn còn 'kiem-tra-chung' thì lặp lại nhập/kiểm tra
+                _log(wk, "[GUILD] Không thấy nút 'gia-nhap-lien-minh'; thử lại quy trình tìm.")
+                if not _sleep_coop(wk, 0.8): return False
+                continue
+
+    _log(wk, "[GUILD] Hết 5 vòng thử xin vào — dừng.")
+    return False
 
 # ------------------ Public: đảm bảo inside ------------------
 def ensure_guild_inside(wk, log=print) -> bool:
