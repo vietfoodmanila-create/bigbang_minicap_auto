@@ -40,6 +40,7 @@ REG_THONG_BAO = (315, 228, 620, 375)
 REG_CUR_SERVER  = (345,1083,506,1145)   # vùng hiển thị server hiện tại
 REG_SERVER_ICON = (43,380,335,478)      # vùng chứa icon server.png
 REG_SERVER_LIST = (318, 331, 856, 1178)    # vùng danh sách server
+REG_SAI_MAT_KHAU = (198, 788, 718, 863)  # vùng hiện thông báo "sai mật khẩu"
 # ================== ẢNH ==================
 IMG_CLEAR_EMAIL_X = resource_path("images/login/clear_email_x.png")
 IMG_EMAIL_EMPTY = resource_path("images/login/email_empty.png")
@@ -53,6 +54,7 @@ IMG_XAC_NHAN_OFFLINE = resource_path("images/login/xac_nhan_offline.png")
 IMG_ICON_LIEN_MINH = resource_path("images/login/icon_lien_minh.png")
 IMG_THONG_BAO = resource_path("images/login/thong-bao.png")
 IMG_SERVER_ICON = resource_path("images/server_list/server.png")
+IMG_SAI_MAT_KHAU = resource_path("images/login/sai_mat_khau.png")
 # ================== GAME PKG/ACT (đồng bộ test) ==================
 GAME_PKG = "com.phsgdbz.vn"
 GAME_ACT = "com.phsgdbz.vn/org.cocos2dx.javascript.GameTwActivity"
@@ -74,6 +76,37 @@ def _is_pixel_gray(img: np.ndarray, x: int, y: int) -> tuple[bool, str]:
         return avg_saturation < GRAY_SATURATION_MAX, msg
     except Exception as e:
         return False, f"Lỗi khi kiểm tra màu pixel: {e}"
+def _update_bad_password(wk, cloud, uga_id):
+    if not uga_id:
+        _log(wk, "[LOGIN][BADPWD] Bỏ qua update (uga_id rỗng)."); return False
+    if not cloud:
+        _log(wk, "[LOGIN][BADPWD] Bỏ qua update (cloud rỗng)."); return False
+
+    payload = {"id": int(uga_id), "status": "bad_password"}
+    try:
+        _log(wk, f"[LOGIN][BADPWD] POST /api/user_game_accounts/status payload={payload}")
+        if hasattr(cloud, "request"):
+            res = cloud.request("POST", "/api/user_game_accounts/status", json=payload)
+        else:
+            _log(wk, "[LOGIN][BADPWD] ❌ CloudClient không có request()."); return False
+
+        _log(wk, f"[LOGIN][BADPWD] RESP={res}")
+        ok = isinstance(res, dict) and res.get("ok") is True and ((res.get("data") or {}).get("status") == "bad_password")
+        if not ok:
+            _log(wk, f"[LOGIN][BADPWD] ⚠️ Server không xác nhận update."); return False
+
+        # Verify nhanh (không bắt buộc)
+        try:
+            ver = cloud.request("GET", "/api/user_game_accounts/status", params={"id": int(uga_id)})
+            _log(wk, f"[LOGIN][BADPWD] VERIFY RESP={ver}")
+        except Exception as ve:
+            _log(wk, f"[LOGIN][BADPWD] VERIFY lỗi: {ve}")
+
+        _log(wk, f"[LOGIN][BADPWD] ✅ Đã cập nhật UGA#{uga_id} → status=bad_password")
+        return True
+    except Exception as e:
+        _log(wk, f"[LOGIN][BADPWD] ❌ Lỗi gọi API update: {e}")
+        return False
 
 def _norm_text(s: str) -> str:
     if not s:
@@ -242,8 +275,13 @@ def _pre_login_taps(wk):
         _sleep_coop(wk, delay)
 
 
-def login_once(wk, email: str, password: str, server: str = "", date: str = "") -> bool:
+def login_once(wk, email: str, password: str, server: str = "", date: str = "", *, uga_id=None, cloud=None) -> bool:
     if _aborted(wk): _log(wk, "⛔ Hủy trước khi login."); return False
+
+    # Reset cờ bad password cho vòng gọi hiện tại
+    try: setattr(wk, "last_login_badpwd", False)
+    except Exception: pass
+
     # Nếu không ở need_login, thử back nhẹ vài lần để lộ form
     st = _state_simple(wk, package_hint=GAME_PKG)
     if st != "need_login":
@@ -252,6 +290,7 @@ def login_once(wk, email: str, password: str, server: str = "", date: str = "") 
 
     _pre_login_taps(wk)
     if _aborted(wk): return False
+
     # 1) Clear & nhập email
     img = _grab_screen_np(wk)
     ok, pt, sc = find_on_frame(img, IMG_CLEAR_EMAIL_X, region=REG_CLEAR_EMAIL_X, threshold=0.86)
@@ -276,18 +315,54 @@ def login_once(wk, email: str, password: str, server: str = "", date: str = "") 
     _type_text(wk, password)
     if not _sleep_coop(wk, 0.2): return False
 
-
-
     # 4) Nhấn Login
     img = _grab_screen_np(wk)
     ok, pt, sc = find_on_frame(img, IMG_LOGIN_BUTTON, region=REG_LOGIN_BUTTON, threshold=0.86)
     free_img(img)
-    if ok and pt:
-        _tap(wk, *pt)
-    else:
-        _tap_center(wk, REG_LOGIN_BUTTON)
+    if ok and pt: _tap(wk, *pt)
+    else:         _tap_center(wk, REG_LOGIN_BUTTON)
     if not _sleep_coop(wk, 1.0): return False
 
+    # 4B) KIỂM TRA SAI MẬT KHẨU TRONG 2S (mỗi 0.25s)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        img = _grab_screen_np(wk)
+        ok_bad, _, sc_bad = find_on_frame(img, IMG_SAI_MAT_KHAU, region=REG_SAI_MAT_KHAU, threshold=0.90)
+        free_img(img)
+        _log(wk, f"[LOGIN] Check 'sai_mat_khau' → ok={ok_bad} score={sc_bad}")
+        if ok_bad:
+            # ĐÁNH DẤU cho runner biết: lần fail này do sai mật khẩu
+            try: setattr(wk, "last_login_badpwd", True)
+            except Exception: pass
+
+            _log(wk, "[LOGIN] ❌ Sai mật khẩu → cập nhật status=bad_password và bỏ qua tài khoản.")
+            if not _sleep_coop(wk, 0.1): return False
+
+            cloud = getattr(wk, 'cloud', None)
+            uga_id = getattr(wk, 'uga_id', None)  # user_game_accounts.id (nếu có)
+            ga_id  = getattr(wk, 'ga_id',  None)  # game_accounts.id (fallback)
+
+            try:
+                if cloud:
+                    url = cloud._url("/api/user_game_accounts/status")
+                    hdr = cloud._auth_headers()
+                    if uga_id:
+                        pl = {"id": int(uga_id), "status": "bad_password"}
+                        _log(wk, f"[LOGIN][BADPWD] POST UGA payload={pl}")
+                    else:
+                        pl = {"game_account_id": int(ga_id), "status": "bad_password"}
+                        _log(wk, f"[LOGIN][BADPWD] POST GA  payload={pl}")
+                    r = cloud.session.post(url, headers=hdr, json=pl, timeout=30)
+                    data = r.json()
+                    _log(wk, f"[LOGIN][BADPWD] RESP={data}")
+                else:
+                    _log(wk, "[LOGIN][BADPWD] Thiếu wk.cloud — bỏ qua cập nhật server.")
+            except Exception as e:
+                _log(wk, f"[LOGIN][BADPWD] Lỗi gọi API update: {e}")
+
+            return False
+
+        if not _sleep_coop(wk, 0.25): return False
     # ===== 5) PHA "VÀO GAME" (LOGIC ĐÚNG) =====
     pressed_once = False
     phase_deadline = time.time() + 60

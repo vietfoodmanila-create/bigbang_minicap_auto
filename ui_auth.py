@@ -238,9 +238,23 @@ class CloudClient:
     def change_password(self, old_password: str, new_password: str) -> dict:
         r = self.session.post(self._url(CHANGE_PASS_PATH), headers=self._auth_headers(), json={"old_password": old_password, "new_password": new_password}, timeout=REQUEST_TIMEOUT)
         self._raise_for_json_error(r); return r.json()
-    def get_game_accounts(self) -> list:
-        """Lấy danh sách tài khoản game của người dùng."""
-        r = self.session.get(self._url("/api/game_accounts"), headers=self._auth_headers(), timeout=REQUEST_TIMEOUT)
+
+    def get_game_accounts(self, status: str = "all") -> list:
+        """
+        Lấy danh sách tài khoản game.
+        - status="all" (mặc định): server trả mọi tài khoản
+        - status="ok"             : server chỉ trả tài khoản còn hợp lệ để chạy
+        """
+        params = {}
+        s = (status or "all").strip().lower()
+        if s != "all":
+            params["status"] = s  # server hiểu 'ok' -> WHERE uga.status="ok"
+        r = self.session.get(
+            self._url("/api/game_accounts"),
+            headers=self._auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
         self._raise_for_json_error(r)
         return r.json().get("accounts", [])
 

@@ -306,7 +306,7 @@ class MainWindow(QMainWindow):
 
         w_feat = QWidget();
         feat_layout = QVBoxLayout(w_feat);
-        grp = QGroupBox("Chọn tính năng");
+        grp = QGroupBox("Tính năng liên minh");
         form = QFormLayout(grp)
         self.chk_build = QCheckBox("Xây dựng liên minh / xem quảng cáo");
         self.chk_expedition = QCheckBox("Viễn chinh")
@@ -373,6 +373,29 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent):
         self._is_closing = True;
         super().closeEvent(event)
+
+    # ── tô màu nền cột Email theo status trong self.tbl_acc ──
+    def apply_status_color_to_account_table(self):
+        from PySide6.QtGui import QColor, QBrush
+        tv = self.tbl_acc  # bảng tài khoản
+        email_col = 1  # cột Email
+        status_col = None  # không có cột status hiển thị -> đọc từ self.online_accounts
+
+        rows = tv.rowCount()
+        accs = getattr(self, "online_accounts", [])  # danh sách tài khoản đã load từ API
+        for r in range(rows):
+            st = "ok"
+            if r < len(accs):
+                st = str(accs[r].get("status") or "ok").lower()
+
+            it = tv.item(r, email_col)
+            if not it:
+                continue
+
+            if st == "ok":
+                it.setBackground(QBrush(QColor(220, 245, 230)))  # xanh nhạt
+            else:
+                it.setBackground(QBrush(QColor(255, 225, 225)))  # đỏ nhạt
 
     def refresh_nox(self):
         adb_map = list_adb_ports_with_status()
@@ -442,7 +465,7 @@ class MainWindow(QMainWindow):
 
             # BƯỚC 2: Truyền danh sách đã lưu vào hàm populate
             self.populate_accounts_table(checked_emails)
-
+            self.apply_status_color_to_account_table()
             self.log_msg(f"Đã làm mới {len(self.online_accounts)} tài khoản.")
         except Exception as e:
             self.online_accounts = []

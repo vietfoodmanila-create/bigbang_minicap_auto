@@ -316,9 +316,9 @@ class AccountRunner(QObject, threading.Thread):
         except Exception:
             pass
         try:
-            mc = getattr(self.wk, "_stats_minicap", 0)
-            sc = getattr(self.wk, "_stats_screencap", 0)
-            last_src = getattr(self.wk, "_frame_source", "unknown")
+            mc = getattr(self, "_stats_minicap", 0)
+            sc = getattr(self, "_stats_screencap", 0)
+            last_src = getattr(self, "_frame_source", "unknown")
             self.log(f"[FRAME] stats: minicap={mc}, screencap={sc}, last={last_src}")
         except Exception:
             pass
@@ -349,19 +349,22 @@ class AccountRunner(QObject, threading.Thread):
 
         while not self._stop.is_set():
             try:
-                # Bước 1: Cập nhật lại danh sách tài khoản từ server
+                # Bước 1: Cập nhật lại danh sách tài khoản từ server (LOGIC CŨ)
                 try:
                     self.log("Đang làm mới danh sách tài khoản từ server...")
                     selected_ids = {acc.get('id') for acc in self.master_account_list}
-                    all_accounts_fresh = self.cloud.get_game_accounts()
-                    self.master_account_list = [acc for acc in all_accounts_fresh if acc.get('id') in selected_ids]
+                    all_accounts_fresh = self.cloud.get_game_accounts(status="ok")
+                    # Server đã lọc status='ok'; client CHỈ lọc theo danh sách đã chọn
+                    self.master_account_list = [
+                        acc for acc in all_accounts_fresh if acc.get('id') in selected_ids
+                    ]
                 except Exception as e:
                     self.log(f"Lỗi làm mới danh sách tài khoản: {e}. Tạm nghỉ 1 phút.")
                     if not self._sleep_coop(60):
                         break
                     continue
 
-                # Bước 2: Lập kế hoạch độc lập
+                # Bước 2: Lập kế hoạch độc lập (giữ nguyên)
                 features = self._get_features()
                 eligible_for_build_expe = _scan_eligible_accounts(self.master_account_list, features)
                 emails_for_build_expe = {acc.get('game_email') for acc in eligible_for_build_expe}
@@ -381,7 +384,7 @@ class AccountRunner(QObject, threading.Thread):
                     except Exception as e:
                         self.log(f"Lỗi lập kế hoạch Chúc phúc: {type(e).__name__}: {e!r}")
 
-                # Bước 3: Tổng hợp danh sách và kiểm tra
+                # Bước 3: Tổng hợp danh sách và kiểm tra (giữ nguyên)
                 emails_for_bless = set(bless_plan.keys())
                 all_emails_to_run = emails_for_build_expe.union(emails_for_bless)
 
@@ -392,9 +395,11 @@ class AccountRunner(QObject, threading.Thread):
                     continue
 
                 accounts_to_run_this_loop = [
-                    acc for acc in self.master_account_list if acc.get('game_email') in all_emails_to_run
+                    acc for acc in self.master_account_list
+                    if acc.get('game_email') in all_emails_to_run
                 ]
 
+                # Ưu tiên account có cả build/expe & bless
                 rec = None
                 for acc in accounts_to_run_this_loop:
                     if acc.get('game_email') in emails_for_build_expe and acc.get('game_email') in emails_for_bless:
@@ -408,14 +413,16 @@ class AccountRunner(QObject, threading.Thread):
                     f"Bắt đầu xử lý: {rec.get('game_email')}"
                 )
 
-                # --- Thực thi tác vụ cho 1 tài khoản ---
+                # --- Thực thi tác vụ cho 1 tài khoản (giữ nguyên) ---
                 account_id = rec.get('id')
                 email = rec.get('game_email', '')
                 encrypted_password = rec.get('game_password', '')
-                server_id = int(rec.get('server_id', '0'))
+                server_id = int(rec.get('server_id', '0') or 0)
+
+                # Lấy img_url server theo server_id → truyền thẳng cho flow
                 resp = self.cloud.get(f"/api/servers?id={server_id}")
                 img_url = (resp.get("data") or {}).get("img_url", "")
-                server = img_url  # truyền thẳng img_url cho flow
+                server = img_url
 
                 try:
                     password = decrypt(encrypted_password, self.user_login_email)
@@ -425,18 +432,30 @@ class AccountRunner(QObject, threading.Thread):
                         break
                     continue
 
+                # Đưa game về trạng thái logout trước khi login
                 if not logout_once(self.wk, max_rounds=7):
-                    self.log(f"Logout thất bại, sẽ thử lại ở vòng lặp sau.")
+                    self.log("Logout thất bại, sẽ thử lại ở vòng lặp sau.")
                     continue
 
+                # Gắn thông tin cho flows_login: cần cloud + uga_id
+                uga_id = (rec.get('uga_id') or rec.get('user_game_account_id') or rec.get('id'))
+
+                self.wk.uga_id = int(uga_id) if uga_id is not None else None
+                self.wk.cloud = self.cloud
+
+                # LOGIN (flows_login sẽ tự check 'sai mật khẩu' 2s và cập nhật bad_password nếu có)
                 ok_login = login_once(self.wk, email, password, server, "")
                 if not ok_login:
-                    self.log(f"Login thất bại cho {email}.")
+                    self.log(f"Login thất bại cho {email} → quay lại đầu vòng lặp để nạp DS mới.")
+                    # QUAY ĐẦU VÒNG LẶP: lần kế tiếp sẽ get_game_accounts() nên acc vừa bad_password sẽ biến mất
+                    if not self._sleep_coop(2.0):
+                        break
                     continue
 
                 did_build = False
                 did_expe = False
 
+                # Chúc phúc (giữ nguyên)
                 if email in bless_plan:
                     targets_to_bless_info = bless_plan[email]
                     target_names = [t['name'] for t in targets_to_bless_info]
@@ -449,7 +468,7 @@ class AccountRunner(QObject, threading.Thread):
                                 if target_info['name'] == name:
                                     try:
                                         self.cloud.record_blessing(target_info['id'], account_id)
-                                        self.log(f"📝 [API] Đã ghi lại lịch sử Chúc phúc cho '{name}'.")
+                                        self.log("📝 [API] Đã ghi lại lịch sử Chúc phúc.")
                                     except Exception as e:
                                         err = None
                                         try:
@@ -459,7 +478,6 @@ class AccountRunner(QObject, threading.Thread):
                                                 err = j.get("error")
                                         except Exception:
                                             pass
-
                                         if err in ("cycle_quota_reached", "already_blessed_today",
                                                    "daily_quota_reached"):
                                             self.log(f"[API] Bỏ qua ghi lịch sử: {err}")
@@ -467,9 +485,10 @@ class AccountRunner(QObject, threading.Thread):
                                             self.log(f"[API] Lỗi ghi lịch sử: {e}")
                                     break
 
+                # Build / Expedition (giữ nguyên)
                 if email in emails_for_build_expe:
                     if (features.get("build") or features.get("expedition")) and _leave_cooldown_passed(
-                        rec.get('last_leave_time')
+                            rec.get('last_leave_time')
                     ):
                         join_guild_once(self.wk, log=self.log)
 
@@ -480,16 +499,19 @@ class AccountRunner(QObject, threading.Thread):
                             self.log("📝 [API] Cập nhật ngày xây dựng.")
 
                     if features.get("expedition") and _expe_cooldown_passed(rec.get('last_expedition_time')):
-                        if ensure_guild_inside(self.wk, log=self.log) and run_guild_expedition_flow(self.wk, log=self.log):
+                        if ensure_guild_inside(self.wk, log=self.log) and run_guild_expedition_flow(self.wk,
+                                                                                                    log=self.log):
                             did_expe = True
                             self.cloud.update_game_account(account_id, {'last_expedition_time': _now_dt_str_for_api()})
                             self.log("📝 [API] Cập nhật mốc viễn chinh.")
 
+                # Auto leave (giữ nguyên)
                 if features.get("autoleave") and (did_build or did_expe):
                     if run_guild_leave_flow(self.wk, log=self.log):
                         self.cloud.update_game_account(account_id, {'last_leave_time': _now_dt_str_for_api()})
                         self.log("📝 [API] Cập nhật mốc rời liên minh.")
 
+                # Kết thúc lượt: thoát game như cũ
                 logout_once(self.wk, max_rounds=7)
 
             except Exception as e:
