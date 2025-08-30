@@ -19,14 +19,23 @@ import numpy as np
 import pytesseract
 from pytesseract import Output
 import unicodedata
-
 # ================== CẤU HÌNH ==================
 ADB = r"D:\Program Files\Nox\bin\nox_adb.exe"
 DEVICE = "127.0.0.1:62025"
 SCREEN_W, SCREEN_H = 900, 1600
+def resource_path(relative_path):
+    """ Lấy đường dẫn tuyệt đối đến tài nguyên, hoạt động cho cả chế độ dev và PyInstaller """
+    try:
+        # PyInstaller tạo một thư mục tạm và lưu đường dẫn trong _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
 
-TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-TESSDATA_DIR  = r"C:\Program Files\Tesseract-OCR\tessdata"
+    return os.path.join(base_path, relative_path)
+
+TESSERACT_EXE =  resource_path(os.path.join("vendor", "Tesseract-OCR", "tesseract.exe"))
+TESSDATA_DIR  = resource_path(os.path.join("vendor", "Tesseract-OCR", "tessdata"))
+TESSDATA_ROOT  = resource_path(os.path.join("vendor", "Tesseract-OCR"))  # cho TESSDATA_PREFIX
 
 IMAGES_DIR = "images"
 DEFAULT_THR = 0.88
@@ -45,15 +54,7 @@ _set_tess_prefix()
 
 
 # ================== TIỆN ÍCH CHUNG ==================
-def resource_path(relative_path):
-    """ Lấy đường dẫn tuyệt đối đến tài nguyên, hoạt động cho cả chế độ dev và PyInstaller """
-    try:
-        # PyInstaller tạo một thư mục tạm và lưu đường dẫn trong _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
 
-    return os.path.join(base_path, relative_path)
 def _run(cmd, text=True, timeout: Optional[int] = None):
     return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout)
 

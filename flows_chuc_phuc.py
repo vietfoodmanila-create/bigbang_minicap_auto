@@ -51,7 +51,7 @@ THR_GUILD = 0.88
 THR_RANK = 0.88
 THR_BTN  = 0.85
 WAIT_PAIR_ICONS_SEC = 15
-SCROLL_LIMIT = 8
+SCROLL_LIMIT = 10
 SWIPE_DUR_MS = 1500  # vuốt chậm & ổn định; chỉnh theo ý nếu cần
 TAP_THIRD = (366, 83)
 # ---------------- Logging helper ----------------
@@ -308,8 +308,8 @@ def run_bless_flow(wk, targets: List[str], log=None, max_scrolls: int = SCROLL_L
 
         # Vuốt chậm & nghỉ 1.5s cho ổn định
         L(wk, f"Kéo trang chậm (dur_ms={SWIPE_DUR_MS}) — 446,1256 → 446,190")
-        swipe(wk, 446, 1255, 446, 188, dur_ms=SWIPE_DUR_MS)
-        if not sleep_coop(wk, 1.5):
+        swipe(wk, 365, 1167, 365, 259, dur_ms=SWIPE_DUR_MS)
+        if not sleep_coop(wk, 1.0):
             break
 
     L(wk, f"KẾT THÚC flow chúc phúc — thành công: {blessed_ok} | chưa xong: {remaining}")

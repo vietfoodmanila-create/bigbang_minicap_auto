@@ -7,6 +7,7 @@ SHOT_DIR = "shots"
 import os
 # Import resource_path từ module.py
 from module import resource_path
+from pathlib import Path
 
 def get_bundled_adb_path() -> str:
     # Đường dẫn tương đối đến adb.exe trong thư mục vendor
@@ -34,5 +35,6 @@ SCREEN_W, SCREEN_H = 900, 1600
 
 # ==== Tesseract ====
 # (Giữ nguyên cấu hình Tesseract của bạn nếu cần)
-TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-TESSDATA_DIR  = r"C:\Program Files\Tesseract-OCR\tessdata"
+TESSERACT_EXE = resource_path(os.path.join("vendor", "Tesseract-OCR", "tesseract.exe"))
+TESSDATA_DIR  = resource_path(os.path.join("vendor", "Tesseract-OCR", "tessdata"))
+TESSDATA_ROOT  = resource_path(os.path.join("vendor", "Tesseract-OCR"))  # cho TESSDATA_PREFIX

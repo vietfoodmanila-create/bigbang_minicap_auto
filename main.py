@@ -11,7 +11,8 @@ import requests
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Qt
 from PySide6.QtWidgets import QApplication, QCheckBox, QTableWidgetItem, QDialog, QMessageBox, QProgressDialog
 from config import PLATFORM_TOOLS_ADB_PATH
-
+from PySide6 import QtGui
+from module import resource_path
 from ui_main import MainWindow, ADB_PATH, list_adb_ports_with_status, list_known_ports_from_data
 from ui_auth import CloudClient, AuthDialog
 
@@ -458,6 +459,7 @@ if __name__ == "__main__":
     force_kill_adb_server()
     os.environ.setdefault("QT_QPA_PLATFORM", "windows")
     app = QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon(resource_path("logo.ico")))
     cloud = CloudClient()
     if check_for_updates(cloud):
         sys.exit(0)
