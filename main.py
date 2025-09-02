@@ -16,7 +16,7 @@ from module import resource_path
 from ui_main import MainWindow, ADB_PATH, list_adb_ports_with_status, list_known_ports_from_data
 from ui_auth import CloudClient, AuthDialog
 
-CURRENT_VERSION = "1.0"  # Đặt phiên bản hiện tại của ứng dụng ở đây
+CURRENT_VERSION = "1.0.1"  # Đặt phiên bản hiện tại của ứng dụng ở đây
 
 def force_kill_adb_server():
     """Dừng tất cả các tiến trình adb.exe đang chạy để đảm bảo sự ổn định."""

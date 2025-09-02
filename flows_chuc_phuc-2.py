@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 flows_chuc_phuc.py
-Flow chúc phúc:
-- Mở bảng xếp hạng theo PHƯƠNG ÁN 2 (duy nhất) đến khi thấy tiêu đề.
-- OCR 7 slot cố định, so khớp với danh sách targets (bỏ dấu + loại non-alnum, KHÔNG 0→o).
-- Tap 3 điểm (tap1 -> tap2 -> (366,83)) với delay an toàn, vuốt chậm để lặp.
-- Tiền xử lý ảnh OCR giống select_server(): scale 2–3x, bilateral, Otsu, invert-theo-mean, morph open, border.
+Flow Chúc phúc: OCR theo "slot" trong một VÙNG giống logic quét server ở login.
+- Quét vùng (321,186,555,1240), chia dải dọc thành nhiều "ô" chồng lấn -> OCR -> normalize (bỏ dấu, non-alnum, '0'->'o')
+- So khớp với danh sách target.
+- Khi match:
+    Tap #1: (270, y_center_slot)
+    Đợi 1.0s -> tìm 'images/chuc_phuc/chuc-phuc.png' -> Tap #2
+    Tap #3: (366, 83)
+- Giữ vuốt/đợi như cũ, log chi tiết từng bước.
 """
 
 from __future__ import annotations
 import time
 from typing import List, Tuple, Optional
 from pathlib import Path
-import unicodedata
-import re
+import unicodedata, re
 
 import cv2
 import numpy as np
@@ -25,39 +27,35 @@ from module import (
 )
 
 # ---------------- Template paths (đặt trong images/chuc_phuc) ----------------
-IMG_MENU = resource_path("images/chuc_phuc/nut-menu.png")
-IMG_GUILD_OUT = resource_path("images/chuc_phuc/lien-minh-outside.png")
-IMG_RANK = resource_path("images/chuc_phuc/bang-xep-hang.png")
-IMG_BTN_RANK = resource_path("images/chuc_phuc/nut-xep-hang.png")
+IMG_MENU       = resource_path("images/chuc_phuc/nut-menu.png")
+IMG_GUILD_OUT  = resource_path("images/chuc_phuc/lien-minh-outside.png")
+IMG_RANK       = resource_path("images/chuc_phuc/bang-xep-hang.png")
+IMG_BTN_RANK   = resource_path("images/chuc_phuc/nut-xep-hang.png")
 IMG_BTN_SERVER = resource_path("images/chuc_phuc/lien-server.png")
+IMG_BLESS_BTN  = resource_path("images/chuc_phuc/chuc-phuc.png")  # Nút 'Chúc phúc' (Tap #2)
 
 # ---------------- Vùng tìm kiếm (x1,y1,x2,y2) ----------------
-REG_MENU = (0, 580, 81, 688)
-REG_GUILD_OUT = (581, 1485, 758, 1600)
-REG_RANK = (578, 38, 826, 130)
-REG_BTN_RANK = (6, 678, 280, 811)
+REG_MENU       = (0, 580, 81, 688)
+REG_GUILD_OUT  = (581, 1485, 758, 1600)
+REG_RANK       = (578, 38, 826, 130)
+REG_BTN_RANK   = (6, 678, 280, 811)
 REG_BTN_SERVER = (478, 1431, 696, 1538)
 
-# ---------------- OCR slots và toạ độ tap ----------------
-# (region, (tap1_x,tap1_y), (tap2_x,tap2_y))
-OCR_SLOTS: List[Tuple[Tuple[int,int,int,int], Tuple[int,int], Tuple[int,int]]] = [
-    ((330,203,540,260),   (265,268),  (758,811)),
-    ((330,343,540,421),   (268,430),  (756,970)),
-    ((330,493,540,573),   (273,586),  (755,1116)),
-    ((330,646,540,721),   (265,745),  (758,635)),
-    ((330,795,540,880),   (263,876),  (760,783)),
-    ((330,945,540,1013),  (263,1031), (756,936)),
-    ((330,1098,540,1170), (270,1186), (760,1090)),
-]
+# VÙNG QUÉT DANH SÁCH CHÚC PHÚC (giống cách REG_SERVER_LIST ở login)
+REG_BLESS_LIST = (321, 186, 555, 1240)
 
-# ---------------- Ngưỡng/timeout ----------------
+# ---------------- Tham số OCR-list/timeout/ngưỡng ----------------
 THR_MENU = 0.88
 THR_GUILD = 0.88
 THR_RANK = 0.88
 THR_BTN  = 0.85
+THR_BLESS = 0.86  # tìm chuc-phuc.png
+
 WAIT_PAIR_ICONS_SEC = 15
 SCROLL_LIMIT = 8
 SWIPE_DUR_MS = 1500  # vuốt chậm & ổn định
+
+# Tap thứ ba giữ nguyên
 TAP_THIRD = (366, 83)
 
 # ---------------- Logging helper ----------------
@@ -72,6 +70,7 @@ def _verify_templates(wk) -> bool:
         ("IMG_RANK", IMG_RANK),
         ("IMG_BTN_RANK", IMG_BTN_RANK),
         ("IMG_BTN_SERVER", IMG_BTN_SERVER),
+        ("IMG_BLESS_BTN", IMG_BLESS_BTN),
     ]
     ok_all = True
     for key, p in pairs:
@@ -82,7 +81,7 @@ def _verify_templates(wk) -> bool:
             L(wk, f"✅ Template {key}: {Path(p).resolve()}")
     return ok_all
 
-# ---------------- Unicode helpers (bỏ dấu + bỏ mọi ký tự không phải chữ/số) ----------------
+# ---------------- Unicode helpers ----------------
 def _strip_vn(s: str) -> str:
     if not s:
         return ""
@@ -93,9 +92,9 @@ def _strip_vn(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
 
-def _normalize_name(s: str) -> str:
-    # KHÔNG thay 0 → o
-    return _strip_vn(s)
+def _norm0(s: str) -> str:
+    # Chuẩn hóa + thay '0' -> 'o' để tránh nhầm lẫn (đồng bộ login/server)
+    return _strip_vn(s).replace("0", "o")
 
 # ---------------- Các helper thao tác ----------------
 def _key_back(wk):
@@ -112,35 +111,7 @@ def _both_icons_present(wk) -> bool:
     finally:
         free_img(img)
 
-# ---------------- Tiền xử lý OCR giống select_server() ----------------
-def _prep_for_ocr(roi: np.ndarray) -> tuple[np.ndarray, dict]:
-    """
-    Pipeline tiền xử lý giống bên select_server:
-      - scale 2–3x (INTER_CUBIC) theo kích thước ROI
-      - chuyển xám, bilateral (d=7, sigmaColor=60, sigmaSpace=60)
-      - Otsu threshold, nếu mean < 127 → invert
-      - morphology open kernel (2,2)
-      - pad viền trắng 6px
-    Trả về ảnh BGR đã prep + info debug (roi_w,h,scale,mean).
-    """
-    h, w = roi.shape[:2]
-    scale = 3 if max(h, w) < 60 else 2
-    img = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=60, sigmaSpace=60)
-    th   = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    mean_val = float(np.mean(th))
-    if mean_val < 127.0:
-        th = cv2.bitwise_not(th)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-    th = cv2.copyMakeBorder(th, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255)
-    prep = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
-
-    info = {"roi_w": w, "roi_h": h, "scale": scale, "mean": mean_val}
-    return prep, info
-
-# ---------------- MỞ BẢNG XẾP HẠNG — PHƯƠNG ÁN 2 (duy nhất) ----------------
+# ---------------- MỞ BẢNG XẾP HẠNG — PHƯƠNG ÁN 2 (giữ nguyên) ----------------
 def _open_ranking_loop(wk) -> bool:
     """
     Chỉ dùng phương án 2, lặp đến khi thấy bang-xep-hang:
@@ -218,90 +189,132 @@ def _open_ranking_loop(wk) -> bool:
         if not sleep_coop(wk, 0.8):
             return False
 
-# ---------------- So khớp OCR ----------------
-def _match_target_norm(tnorm: str, targets_norm: List[str]) -> int:
+# ---------------- OCR list + Tap (theo vùng giống login/select_server) ----------------
+def _ocr_list_and_bless(wk, targets: List[str]) -> List[str]:
     """
-    Trả về index trong targets_norm nếu khớp (==, chứa, bị chứa). Không khớp trả -1.
-    """
-    if not tnorm:
-        return -1
-    for i, name_norm in enumerate(targets_norm):
-        if tnorm == name_norm or tnorm in name_norm or name_norm in tnorm:
-            return i
-    return -1
-
-def _ocr_page_and_bless(wk, targets: List[str]) -> List[str]:
-    """
-    OCR 7 vùng, nếu tên có trong targets thì nhấn 3 điểm và trả về DANH SÁCH TÊN GỐC đã chúc.
-    - Tiền xử lý ảnh ROI theo pipeline của select_server (không 0→o).
-    - So khớp theo dạng đã chuẩn hoá (bỏ dấu + remove non-alnum) ở CẢ 2 phía.
-    - Tap 3 điểm: tap1 -> tap2 -> (366, 83) với delay 1.0s, 1.0s, 0.5s.
+    Quét danh sách trong REG_BLESS_LIST theo slot dọc (overlap), OCR + normalize (0->o),
+    so khớp với targets. Khi match:
+      - Tap #1: (270, y_center_slot)
+      - Đợi 1.0s → tìm IMG_BLESS_BTN → Tap #2 (nếu thấy)
+      - Tap #3: TAP_THIRD
+    Trả về list tên gốc đã chúc.
     """
     done: List[str] = []
     if not targets:
         return done
 
-    # BẢN SAO CỤC BỘ để không mutate danh sách caller
-    loc_targets = list(targets)
-    loc_norm = [_normalize_name(x) for x in loc_targets]
-    L(wk, f"OCR page — targets còn lại: {targets} (norm={loc_norm})")
+    # Danh sách tạm (không mutate đầu vào)
+    remain = list(targets)
+    remain_norm = [_norm0(x) for x in remain]
+    L(wk, f"[OCR-LIST] targets={targets} (norm={remain_norm})")
 
-    img_full = grab_screen_np(wk)
+    x1, y1, x2, y2 = REG_BLESS_LIST
+    H = max(1, y2 - y1)
+    N_SLOTS = 12
+    row_h  = max(32, H // N_SLOTS)
+    stride = max(20, int(row_h * 0.75))  # chồng lấn 25% tránh cắt hụt
+
+    img = grab_screen_np(wk)
     try:
-        for idx, (reg, tap1, tap2) in enumerate(OCR_SLOTS, start=1):
-            x1, y1, x2, y2 = reg
-            slot = img_full[y1:y2, x1:x2].copy()
+        L(wk, f"[OCR-LIST] reg={REG_BLESS_LIST} → row_h≈{row_h}, stride={stride}")
 
-            # Tiền xử lý ROI theo pipeline giống select_server
-            prep, info = _prep_for_ocr(slot)
+        i = 0
+        ry1 = y1
+        while ry1 + 10 < y2:
+            ry2 = min(y2, ry1 + row_h)
+            roi = img[ry1:ry2, x1:x2].copy()
+            h, w = roi.shape[:2]
 
-            try:
-                t7 = (ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=7) or "").strip()
-            except Exception:
-                t7 = ""
+            # --- Preprocess OCR (đồng bộ login/select_server) ---
+            scale = 3 if max(h, w) < 60 else 2
+            roi2  = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            gray  = cv2.cvtColor(roi2, cv2.COLOR_BGR2GRAY)
+            gray  = cv2.bilateralFilter(gray, d=7, sigmaColor=60, sigmaSpace=60)
+            th    = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            mean_val = float(np.mean(th))
+            if mean_val < 127.0:
+                th = cv2.bitwise_not(th)
+            th = cv2.morphologyEx(th, cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+                                  iterations=1)
+            th = cv2.copyMakeBorder(th, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=255)
+            prep = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
+
+            t7 = (ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=7) or "").strip()
             t6 = "" if t7 else (ocr_region(prep, 0, 0, prep.shape[1], prep.shape[0], lang="vie", psm=6) or "").strip()
+            use_txt  = (t7 or t6).replace("\n", " ")
+            use_norm = _norm0(use_txt)
 
-            use_txt  = (t7 or t6).replace("\n", " ").strip()
-            tnorm    = _normalize_name(use_txt)
-            match_ix = _match_target_norm(tnorm, loc_norm)
-            matched  = (match_ix >= 0)
+            i += 1
+            # So khớp với mọi target
+            found_idx = -1
+            for k, tn in enumerate(remain_norm):
+                if use_norm and (use_norm == tn or use_norm in tn or tn in use_norm):
+                    found_idx = k; break
 
-            L(wk,
-              f"OCR slot#{idx:02d} reg=({x1},{y1},{x2},{y2}) ROI={info['roi_w']}x{info['roi_h']} "
-              f"scale={info['scale']} mean={info['mean']:.1f} "
-              f"psm7='{t7}' psm6='{t6}' → use='{use_txt}' norm='{tnorm}' match={matched}")
+            hit = (found_idx >= 0)
+            L(wk, f"[OCR-LIST] SLOT#{i:02d} reg=({x1},{ry1},{x2},{ry2}) ROI={w}x{h} "
+                  f"scale={scale} mean={mean_val:.1f} psm7='{t7}' psm6='{t6}' "
+                  f"→ use='{use_txt}' norm='{use_norm}' "
+                  f"expected∈{remain_norm} match={hit}")
 
-            if not matched:
-                continue
+            if hit:
+                orig_name = remain[found_idx]
+                cy = (ry1 + ry2) // 2
+                tap1 = (270, cy)  # theo yêu cầu: x=270, y lấy theo slot (giống tham số y của tap login)
+                L(wk, f"[OCR-LIST] ✅ MATCH '{orig_name}' → TAP#1 {tap1}")
+                tap(wk, *tap1)
+                if not sleep_coop(wk, 1.0):
+                    return done
 
-            orig_name = loc_targets[match_ix]
-            L(wk, f"Slot#{idx:02d} → KHỚP: '{orig_name}' | Tap {tap1} → {tap2} → {TAP_THIRD}")
+                # Tìm nút Chúc phúc (Tap #2)
+                img2 = grab_screen_np(wk)
+                try:
+                    okb, posb, scb = find_on_frame(img2, IMG_BLESS_BTN, threshold=THR_BLESS)
+                    L(wk, f"[OCR-LIST] FIND 'chuc-phuc.png' → ok={okb} pos={posb} sc={scb}")
+                finally:
+                    free_img(img2)
 
-            # TAP 3 ĐIỂM với delay an toàn
-            tap(wk, *tap1);           sleep_coop(wk, 1.0)
-            tap(wk, *tap2);           sleep_coop(wk, 1.0)
-            tap(wk, *TAP_THIRD);      sleep_coop(wk, 0.5)
+                if okb and posb:
+                    tap(wk, *posb)
+                    L(wk, f"[OCR-LIST] TAP#2 tại {posb}")
+                    if not sleep_coop(wk, 1.0):
+                        return done
+                else:
+                    L(wk, "[OCR-LIST] ⚠️ Không thấy nút 'Chúc phúc' sau TAP#1.")
 
-            done.append(orig_name)
+                # Tap #3 (giữ nguyên)
+                tap(wk, *TAP_THIRD)
+                L(wk, f"[OCR-LIST] TAP#3 tại {TAP_THIRD}")
+                if not sleep_coop(wk, 0.5):
+                    return done
 
-            # Loại mục đã khớp khỏi BẢN SAO CỤC BỘ để tránh nhấn trùng trong cùng trang
-            loc_targets.pop(match_ix)
-            loc_norm.pop(match_ix)
+                done.append(orig_name)
+                # loại mục đã match để tránh chúc trùng trên cùng trang
+                remain.pop(found_idx); remain_norm.pop(found_idx)
 
-            if not loc_norm:
-                L(wk, "Đã hoàn tất toàn bộ targets trên trang hiện tại.")
-                break
+                # Nếu đã hết mục tiêu trên trang, có thể kết thúc vòng chạy trang
+                if not remain_norm:
+                    L(wk, "[OCR-LIST] Hết mục tiêu cần tìm trên trang hiện tại.")
+                    break
+
+            # Next slot
+            ry1 += stride
+
     finally:
-        free_img(img_full)
+        free_img(img)
 
-    L(wk, f"OCR page xong — matched (orig): {done}")
+    if done:
+        L(wk, f"[OCR-LIST] xong trang — matched: {done}")
+    else:
+        L(wk, "[OCR-LIST] xong trang — chưa match được ai.")
     return done
 
 # ==================== ENTRYPOINT ====================
 def run_bless_flow(wk, targets: List[str], log=None, max_scrolls: int = SCROLL_LIMIT) -> List[str]:
     """
     - Mở “Bảng xếp hạng” bằng phương án 2, lặp tới khi thấy.
-    - OCR & chúc phúc các tên trong 'targets'.
+    - OCR & chúc phúc các tên trong 'targets' bằng vùng REG_BLESS_LIST theo slot (giống login).
     - Kéo trang tối đa 'max_scrolls' lần (vuốt chậm SWIPE_DUR_MS) đến khi hoàn tất.
     """
     L(wk, f"BẮT ĐẦU flow chúc phúc — targets={targets}")
@@ -312,7 +325,7 @@ def run_bless_flow(wk, targets: List[str], log=None, max_scrolls: int = SCROLL_L
         L(wk, "Dừng flow: thiếu template ảnh cần thiết.")
         return []
 
-    # Mở bảng xếp hạng: CHỈ phương án 2
+    # Mở bảng xếp hạng: PHƯƠNG ÁN 2 (như cũ)
     if not _open_ranking_loop(wk):
         L(wk, "Không thể mở bảng xếp hạng — kết thúc.")
         return []
@@ -326,18 +339,17 @@ def run_bless_flow(wk, targets: List[str], log=None, max_scrolls: int = SCROLL_L
 
     for scroll_idx in range(0, max_scrolls + 1):
         L(wk, f"----- Trang/Scroll vòng {scroll_idx}/{max_scrolls} — remaining={remaining}")
-        done = _ocr_page_and_bless(wk, remaining)
+        done = _ocr_list_and_bless(wk, remaining)
 
         if done:
             blessed_ok.extend(done)
-            # loại các tên đã xong khỏi remaining (so khớp theo norm)
-            rem_norm = [_normalize_name(x) for x in remaining]
+            # loại khỏi remaining theo chuẩn hoá để an toàn
+            rem_norm = [_norm0(x) for x in remaining]
             for d in done:
-                nd = _normalize_name(d)
+                nd = _norm0(d)
                 for i, rname in enumerate(rem_norm):
                     if rname == nd:
-                        remaining.pop(i)
-                        rem_norm.pop(i)
+                        remaining.pop(i); rem_norm.pop(i)
                         break
 
         if not remaining:
@@ -348,10 +360,11 @@ def run_bless_flow(wk, targets: List[str], log=None, max_scrolls: int = SCROLL_L
             L(wk, f"ĐÃ ĐỦ {max_scrolls} lần cuộn — dừng lại. Chưa xong: {remaining}")
             break
 
-        # Vuốt chậm & nghỉ 1.5s cho ổn định
+        # Vuốt chậm & nghỉ 1.5s cho ổn định (giữ thông số cũ)
         L(wk, f"Kéo trang chậm (dur_ms={SWIPE_DUR_MS}) — 446,1256 → 446,190")
-        swipe(wk, 446, 1256, 446, 190, dur_ms=SWIPE_DUR_MS)
+        swipe(wk, 446, 1255, 446, 188, dur_ms=SWIPE_DUR_MS)
         if not sleep_coop(wk, 1.5):
-            return blessed_ok
+            break
 
+    L(wk, f"KẾT THÚC flow chúc phúc — thành công: {blessed_ok} | chưa xong: {remaining}")
     return blessed_ok

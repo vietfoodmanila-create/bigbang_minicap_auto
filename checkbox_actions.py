@@ -24,6 +24,7 @@ from flows_chuc_phuc import run_bless_flow
 from ui_auth import CloudClient
 from utils_crypto import decrypt
 from minicap_worker import MinicapWorker
+from ui_main import MainWindow, BLESS_COL_CHECK, BLESS_COL_NAME
 
 GAME_PKG = "com.phsgdbz.vn"
 GAME_ACT = "com.phsgdbz.vn/org.cocos2dx.javascript.GameTwActivity"
@@ -204,28 +205,62 @@ class SimpleNoxWorker:
     def _run(self, args: List[str], timeout=8, text=True):
         import subprocess
         try:
+            # Ẩn hoàn toàn cửa sổ tiến trình con trên Windows
             startupinfo = None
+            creationflags = 0
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            p = subprocess.run([self._adb, "-s", self._serial, *args], capture_output=True, text=text, timeout=timeout,
-                               startupinfo=startupinfo, encoding='utf-8', errors='ignore')
-            return p.returncode, p.stdout or "", p.stderr or ""
+                startupinfo.wShowWindow = 0  # SW_HIDE
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    creationflags = subprocess.CREATE_NO_WINDOW
+
+            # Khi text=True thì trả str (UTF-8, bỏ lỗi); text=False trả bytes
+            run_kwargs = dict(
+                capture_output=True,
+                timeout=timeout,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+                stdin=subprocess.DEVNULL,  # không mở console để chờ input
+            )
+            if text:
+                run_kwargs.update(text=True, encoding='utf-8', errors='ignore')
+            else:
+                run_kwargs.update(text=False)
+
+            p = subprocess.run([self._adb, "-s", self._serial, *args], **run_kwargs)
+            if text:
+                return p.returncode, (p.stdout or ""), (p.stderr or "")
+            else:
+                # Nhánh này hiếm dùng vì hàm này mặc định text=True
+                return p.returncode, (p.stdout or b""), (p.stderr or b"")
         except subprocess.TimeoutExpired:
-            return 124, "", "timeout"
+            return (124, "" if text else b"", "timeout" if text else b"timeout")
         except Exception as e:
-            return 125, "", str(e)
+            return (125, "" if text else b"", (str(e) if text else str(e).encode()))
 
     def _run_raw(self, args: List[str], timeout=8):
         import subprocess
         try:
+            # Ẩn hoàn toàn cửa sổ tiến trình con trên Windows
             startupinfo = None
+            creationflags = 0
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            p = subprocess.run([self._adb, "-s", self._serial, *args], capture_output=True, timeout=timeout,
-                               startupinfo=startupinfo)
-            return p.returncode, p.stdout, p.stderr
+                startupinfo.wShowWindow = 0  # SW_HIDE
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    creationflags = subprocess.CREATE_NO_WINDOW
+
+            p = subprocess.run(
+                [self._adb, "-s", self._serial, *args],
+                capture_output=True,
+                timeout=timeout,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+                stdin=subprocess.DEVNULL,  # không mở console để chờ input
+            )
+            return p.returncode, (p.stdout or b""), (p.stderr or b"")
         except subprocess.TimeoutExpired:
             return 124, b"", b"timeout"
         except Exception as e:
@@ -375,10 +410,29 @@ class AccountRunner(QObject, threading.Thread):
                     try:
                         bless_config = self.cloud.get_blessing_config()
                         bless_targets = self.cloud.get_blessing_targets()
+
+                        # Lọc danh sách target theo tick trong UI "DS Chúc phúc"
+                        tvb = self.ctrl.w.tbl_bless
+                        selected_target_names = set()
+                        for r in range(tvb.rowCount()):
+                            w = tvb.cellWidget(r, BLESS_COL_CHECK)
+                            cb = w.findChild(QCheckBox) if w else None
+                            if cb and cb.isChecked():
+                                it = tvb.item(r, BLESS_COL_NAME)
+                                if it:
+                                    selected_target_names.add(it.text().strip())
+
+                        if selected_target_names:
+                            bless_targets = [
+                                t for t in bless_targets
+                                if (t.get("name") or t.get("target_name") or "").strip() in selected_target_names
+                            ]
+
                         priority_emails = list(emails_for_build_expe)
                         bless_plan = _plan_online_blessings(
                             self.master_account_list, bless_config, bless_targets, priority_emails
                         )
+
                         if bless_plan:
                             self.log(f"Đã lập kế hoạch Chúc phúc cho {len(bless_plan)} tài khoản.")
                     except Exception as e:

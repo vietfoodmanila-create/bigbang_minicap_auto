@@ -23,6 +23,31 @@ import unicodedata
 ADB = r"D:\Program Files\Nox\bin\nox_adb.exe"
 DEVICE = "127.0.0.1:62025"
 SCREEN_W, SCREEN_H = 900, 1600
+# module.py — sau khi cấu hình đường dẫn Tesseract và trước khi dùng OCR
+def _patch_pytesseract_no_console():
+    try:
+        import subprocess as _sp
+        import pytesseract as _pte
+
+        # Giữ Popen gốc để gọi lại bên trong wrapper
+        _orig_popen = _pte.pytesseract.subprocess.Popen
+
+        def _popen_no_console(*args, **kwargs):
+            # Ẩn mọi cửa sổ process con do pytesseract gọi
+            if os.name == 'nt':
+                si = _sp.STARTUPINFO()
+                si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+                kwargs.setdefault("startupinfo", si)
+                kwargs.setdefault("creationflags", _sp.CREATE_NO_WINDOW)
+            return _orig_popen(*args, **kwargs)
+
+        _pte.pytesseract.subprocess.Popen = _popen_no_console
+    except Exception:
+        # Nếu có lỗi, bỏ qua để không ảnh hưởng logic cũ
+        pass
+
+_patch_pytesseract_no_console()
+
 def resource_path(relative_path):
     """ Lấy đường dẫn tuyệt đối đến tài nguyên, hoạt động cho cả chế độ dev và PyInstaller """
     try:

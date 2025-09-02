@@ -66,8 +66,10 @@ GAME_LOGIN_URL = "https://pay.bigbangthoikhong.vn/login?game_id=105"
 ACC_HEADERS_VISIBLE = ["", "Email", "Xem", "Sửa", "Xóa"]
 ACC_COL_CHECK, ACC_COL_EMAIL, ACC_COL_STATUS, ACC_COL_EDIT, ACC_COL_DELETE = range(5)
 
-BLESS_HEADERS_VISIBLE = ["Tên nhân vật", "Lần cuối chạy"]
-BLESS_COL_NAME, BLESS_COL_LAST = range(2)
+# Thêm cột checkbox cho DS Chúc phúc
+BLESS_HEADERS_VISIBLE = ["", "Tên nhân vật", "Lần cuối chạy"]
+BLESS_COL_CHECK, BLESS_COL_NAME, BLESS_COL_LAST = range(3)
+
 
 
 # ---------------- Helpers & Dialogs (SỬA ĐỔI LOGIC NHẬN DIỆN) ----------------
@@ -355,10 +357,19 @@ class MainWindow(QMainWindow):
         form_bconf.addRow(QLabel("Giãn cách (giờ):"), self.ed_bless_cooldown);
         form_bconf.addRow(QLabel("Số lượt chúc mỗi lần:"), self.ed_bless_perrun)
         bless_layout.addWidget(grp_bconf)
-        self.tbl_bless = QTableWidget(0, len(BLESS_HEADERS_VISIBLE));
+        # Thanh công cụ DS Chúc phúc: checkbox "Chọn tất cả"
+        bless_toolbar = QHBoxLayout()
+        self.chk_select_all_bless = QCheckBox("Chọn tất cả")
+        bless_toolbar.addWidget(self.chk_select_all_bless)
+        bless_toolbar.addStretch()
+        bless_layout.addLayout(bless_toolbar)
+
+        self.tbl_bless = QTableWidget(0, len(BLESS_HEADERS_VISIBLE))
         self.tbl_bless.setHorizontalHeaderLabels(BLESS_HEADERS_VISIBLE)
-        self.tbl_bless.horizontalHeader().setSectionResizeMode(BLESS_COL_NAME, QHeaderView.Stretch);
+        self.tbl_bless.horizontalHeader().setSectionResizeMode(BLESS_COL_CHECK, QHeaderView.ResizeToContents)
+        self.tbl_bless.horizontalHeader().setSectionResizeMode(BLESS_COL_NAME, QHeaderView.Stretch)
         self.tbl_bless.horizontalHeader().setSectionResizeMode(BLESS_COL_LAST, QHeaderView.ResizeToContents)
+        self.tbl_bless.setEditTriggers(QAbstractItemView.NoEditTriggers)
         bless_layout.addWidget(self.tbl_bless)
         bless_btns = QHBoxLayout();
         self.btn_bless_add = QPushButton("Thêm hàng");
@@ -390,6 +401,7 @@ class MainWindow(QMainWindow):
         self.btn_bless_del.clicked.connect(self.bless_del_online);
         self.btn_bless_load.clicked.connect(self.load_bless_online);
         self.btn_bless_save.clicked.connect(self.save_bless_config_online)
+        self.chk_select_all_bless.toggled.connect(self.on_select_all_bless)
 
         self.refresh_nox()
         if self.tbl_nox.rowCount() > 0: self.tbl_nox.selectRow(0)
@@ -866,28 +878,77 @@ class MainWindow(QMainWindow):
             widget = self.tbl_acc.cellWidget(row, ACC_COL_CHECK)
             if widget and (chk_box := widget.findChild(QCheckBox)): chk_box.setChecked(checked)
 
+    def on_select_all_bless(self, checked: bool):
+        for row in range(self.tbl_bless.rowCount()):
+            w = self.tbl_bless.cellWidget(row, BLESS_COL_CHECK)
+            if not w:
+                continue
+            cb = w.findChild(QCheckBox)
+            if cb:
+                cb.setChecked(checked)
+
     def load_bless_online(self):
-        if self.active_device_id is None: return
+        if self.active_device_id is None:
+            return
         try:
-            self.log_msg("Đang tải cấu hình và DS Chúc phúc từ server...")
+            self.log_msg("Đang tải cấu hình và DS Chúc phúc từ server.")
             QApplication.setOverrideCursor(Qt.WaitCursor)
+
+            # Nhớ những mục đang check để khôi phục sau khi reload
+            selected_names = set()
+            for r in range(self.tbl_bless.rowCount()):
+                w = self.tbl_bless.cellWidget(r, BLESS_COL_CHECK)
+                cb = w.findChild(QCheckBox) if w else None
+                if cb and cb.isChecked():
+                    it_name = self.tbl_bless.item(r, BLESS_COL_NAME)
+                    if it_name:
+                        selected_names.add(it_name.text().strip())
+
+            # Load config
             config = self.cloud.get_blessing_config()
             self.ed_bless_cooldown.setText(str(config.get("cooldown_hours", 8)))
             self.ed_bless_perrun.setText(str(config.get("per_run", 3)))
+
+            # Load targets (toàn bộ cho UI)
             self.blessing_targets = self.cloud.get_blessing_targets(fetch_all=True)
+
+            # Đổ bảng
             self.tbl_bless.setRowCount(0)
             for item in self.blessing_targets:
-                r = self.tbl_bless.rowCount();
+                r = self.tbl_bless.rowCount()
                 self.tbl_bless.insertRow(r)
-                self.tbl_bless.setItem(r, BLESS_COL_NAME, QTableWidgetItem(item.get("target_name", "")))
+
+                # Cột checkbox
+                chk_widget = QWidget()
+                lay = QHBoxLayout(chk_widget)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setAlignment(Qt.AlignCenter)
+                cb = QCheckBox()
+                # Khôi phục tick nếu trước đó đã chọn
+                if (item.get("target_name") or "").strip() in selected_names:
+                    cb.setChecked(True)
+                lay.addWidget(cb)
+                self.tbl_bless.setCellWidget(r, BLESS_COL_CHECK, chk_widget)
+
+                # Cột tên (gắn id vào UserRole)
+                name = item.get("target_name", "")
+                it_name = QTableWidgetItem(name)
+                try:
+                    it_name.setData(Qt.UserRole, int(item.get("id") or 0))
+                except Exception:
+                    it_name.setData(Qt.UserRole, 0)
+                self.tbl_bless.setItem(r, BLESS_COL_NAME, it_name)
+
+                # Cột lần cuối
                 last_run_str = item.get("last_blessed_run_at", "")
                 if last_run_str:
                     try:
-                        dt = datetime.fromisoformat(last_run_str);
-                        last_run_str = dt.strftime('%d/%m/%Y %H:%M')
-                    except:
+                        dt = datetime.fromisoformat(last_run_str)
+                        last_run_str = dt.strftime("%d/%m/%Y %H:%M")
+                    except Exception:
                         pass
                 self.tbl_bless.setItem(r, BLESS_COL_LAST, QTableWidgetItem(last_run_str))
+
             self.log_msg(f"Đã tải {len(self.blessing_targets)} mục tiêu Chúc phúc.")
         except Exception as e:
             detail = ""
