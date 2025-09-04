@@ -22,12 +22,12 @@ from module import (
 USE_CV = True  # cần opencv-python
 
 # ================= REGIONS =================
-REG_DA_DANG_NHAP        = (416, 996, 596, 1050)
+REG_DA_DANG_NHAP        = (321,985,618,1055)
 REG_XAC_NHAN_THOAT      = (473, 878, 788, 1011)
 REG_DOI_TAI_KHOAN       = (490, 1105, 768, 1230)
 REG_XAC_NHAN_DOI_TK     = (496, 891, 776, 1010)
 MENU_REGION             = (0, 580, 81, 688)
-REG_CAI_DAT             = (13, 803, 275, 943)
+REG_CAI_DAT             = (10,798,270,938)
 
 REG_PHU_DE              = (0, 1466, 170, 1588)
 REG_NUT_QUAY_LAI        = (3, 1348, 175, 1596)
